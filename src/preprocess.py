@@ -184,8 +184,8 @@ def get_underlying_price_data(
     Returns:
         DataFrame with OHLCV data
     """
-    # Download data
-    df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+    # Download data with UNADJUSTED prices (options use actual prices, not adjusted)
+    df = yf.download(ticker, start=start_date, end=end_date, progress=False, auto_adjust=False)
     
     # Reset index to make date a column
     df = df.reset_index()
@@ -197,6 +197,11 @@ def get_underlying_price_data(
     
     # Normalize column names to lowercase
     df.columns = df.columns.str.lower()
+    
+    # Ensure we use 'close' column (not 'adj close') for unadjusted prices
+    if 'adj close' in df.columns and 'close' in df.columns:
+        # Remove adj close to avoid confusion
+        df = df.drop(columns=['adj close'])
     
     # Add ticker column
     df['ticker'] = ticker.upper()

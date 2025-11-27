@@ -79,30 +79,35 @@ def black_scholes_price(
         raise ValueError(f"Volatility cannot be negative, got {sigma}")
     if option_type not in ['call', 'put']:
         raise ValueError(f"option_type must be 'call' or 'put', got {option_type}")
-    
-    # TODO: Handle edge case - at expiration (T = 0)
-    # Hint: Return max(S - K, 0) for call or max(K - S, 0) for put
-    
-    # TODO: Handle edge case - zero volatility (sigma = 0)
-    # Hint: Return discounted intrinsic value
-    
-    # TODO: Calculate d1
-    # Formula: d1 = [ln(S/K) + (r + sigma²/2)*T] / (sigma*sqrt(T))
-    # Use: np.log() for natural log, np.sqrt() for square root
-    
-    # TODO: Calculate d2
-    # Formula: d2 = d1 - sigma*sqrt(T)
-    
-    # TODO: Calculate cumulative normal distributions
-    # Use: norm.cdf(d1) and norm.cdf(d2)
-    
-    # TODO: Calculate option price based on type
-    # Call: S*N(d1) - K*exp(-r*T)*N(d2)
-    # Put: K*exp(-r*T)*N(-d2) - S*N(-d1)
-    # Use: np.exp() for exponential
-    
-    pass  # Remove this after implementation
 
+    # Calculate d1 and d2
+    denom = sigma* np.sqrt(T)
+    d_1_num = np.log(S / K) + (r + (sigma ** 2) / 2) * T
+    d1 = d_1_num / denom if denom != 0 else 0
+    d2 = d1 - sigma * np.sqrt(T)
+
+    if option_type == 'call':
+        # If contract expired, return 0 or difference between underlying and strike
+        if T == 0:
+            return intrinsic_value(S, K, option_type)
+        
+        # If no vol, return discounted intrinsic value
+        if sigma == 0:
+            return max(S - K * np.exp(-r*T), 0)
+
+        return (S * norm.cdf(d1)) - (K * np.exp(-r*T) * norm.cdf(d2))
+
+    if option_type == 'put':
+        # If contract expired, return 0 or difference between underlying and strike
+        if T == 0:
+            return intrinsic_value(S, K, option_type)
+
+        # If no vol, return discounted intrinsic value
+        if sigma == 0:
+            return max((K * np.exp(-r*T)) - S, 0)
+
+        return (K * np.exp(-r*T) * norm.cdf(-d2)) - (S * norm.cdf(-d1)) 
+  
 
 def intrinsic_value(
     S: float,
@@ -127,7 +132,11 @@ def intrinsic_value(
         - Put intrinsic value: max(K - S, 0)
     """
     # TODO: Implement
-    pass
+    if option_type == 'call':
+        return max(S - K, 0)
+
+    if option_type == 'put':
+        return max(K - S, 0)
 
 
 def time_value(
@@ -154,8 +163,7 @@ def time_value(
     
     Hint: Use intrinsic_value() function
     """
-    # TODO: Implement
-    pass
+    return option_price - intrinsic_value(S, K, option_type)
 
 
 def moneyness(
@@ -181,9 +189,16 @@ def moneyness(
         - Call ITM: S > K
         - Put ITM: K > S
     """
-    # TODO: Implement
-    pass
-
+    # Check ATM first
+    if np.abs(S - K) / S < 0.005:
+        return 'ATM'
+    
+    # Check based on option type
+    if option_type == 'call':
+        return 'ITM' if S > K else 'OTM'
+    else:  # put
+        return 'ITM' if S < K else 'OTM'
+    
 
 # Validation function to test your implementation
 def validate_pricer():
@@ -198,6 +213,7 @@ def validate_pricer():
     print("="*60)
     
     test_cases = [
+        # Standard test cases
         {
             'name': 'ATM Call (Hull Example 13.6)',
             'params': {'S': 42, 'K': 40, 'T': 0.5, 'r': 0.10, 'sigma': 0.20},
@@ -214,20 +230,86 @@ def validate_pricer():
             'name': 'OTM Call',
             'params': {'S': 100, 'K': 110, 'T': 1.0, 'r': 0.05, 'sigma': 0.25},
             'type': 'call',
-            'expected': 8.02
+            'expected': 8.03
         },
         {
             'name': 'ITM Put',
             'params': {'S': 100, 'K': 110, 'T': 1.0, 'r': 0.05, 'sigma': 0.25},
             'type': 'put',
-            'expected': 12.35
+            'expected': 12.66
         },
         {
             'name': 'Deep ITM Call',
             'params': {'S': 150, 'K': 100, 'T': 0.25, 'r': 0.05, 'sigma': 0.30},
             'type': 'call',
-            'expected': 51.39
-        }
+            'expected': 51.26
+        },
+        
+        # Additional standard cases
+        {
+            'name': 'Deep OTM Put',
+            'params': {'S': 150, 'K': 100, 'T': 0.5, 'r': 0.05, 'sigma': 0.20},
+            'type': 'put',
+            'expected': 0.01  # Nearly worthless
+        },
+        {
+            'name': 'Short-dated ATM Call',
+            'params': {'S': 100, 'K': 100, 'T': 30/365, 'r': 0.03, 'sigma': 0.25},
+            'type': 'call',
+            'expected': 2.98
+        },
+        {
+            'name': 'High Vol ITM Put',
+            'params': {'S': 90, 'K': 100, 'T': 0.5, 'r': 0.04, 'sigma': 0.40},
+            'type': 'put',
+            'expected': 15.06
+        },
+        
+        # Edge case: At expiration (T=0)
+        {
+            'name': 'Edge Case: ITM Call at Expiration',
+            'params': {'S': 110, 'K': 100, 'T': 0, 'r': 0.05, 'sigma': 0.20},
+            'type': 'call',
+            'expected': 10.0  # Pure intrinsic value
+        },
+        {
+            'name': 'Edge Case: OTM Call at Expiration',
+            'params': {'S': 90, 'K': 100, 'T': 0, 'r': 0.05, 'sigma': 0.20},
+            'type': 'call',
+            'expected': 0.0  # Worthless
+        },
+        {
+            'name': 'Edge Case: ITM Put at Expiration',
+            'params': {'S': 90, 'K': 100, 'T': 0, 'r': 0.05, 'sigma': 0.20},
+            'type': 'put',
+            'expected': 10.0  # Pure intrinsic value
+        },
+        {
+            'name': 'Edge Case: OTM Put at Expiration',
+            'params': {'S': 110, 'K': 100, 'T': 0, 'r': 0.05, 'sigma': 0.20},
+            'type': 'put',
+            'expected': 0.0  # Worthless
+        },
+        
+        # Edge case: Zero volatility (sigma=0)
+        {
+            'name': 'Edge Case: Zero Vol ITM Call',
+            'params': {'S': 110, 'K': 100, 'T': 1.0, 'r': 0.05, 'sigma': 0.0},
+            'type': 'call',
+            'expected': 14.88  # S - K*e^(-rT) = 110 - 100*0.9512 = 14.88
+        },
+        {
+            'name': 'Edge Case: Zero Vol OTM Call',
+            'params': {'S': 90, 'K': 100, 'T': 1.0, 'r': 0.05, 'sigma': 0.0},
+            'type': 'call',
+            'expected': 0.0  # max(90 - 100*0.9512, 0) = 0
+        },
+        {
+            'name': 'Edge Case: Zero Vol ITM Put',
+            'params': {'S': 90, 'K': 100, 'T': 1.0, 'r': 0.05, 'sigma': 0.0},
+            'type': 'put',
+            'expected': 5.12  # K*e^(-rT) - S = 100*0.9512 - 90 = 5.12
+        },
     ]
     
     all_passed = True
@@ -252,8 +334,40 @@ def validate_pricer():
             all_passed = False
     
     print("\n" + "="*60)
+    print("PUT-CALL PARITY VERIFICATION")
+    print("="*60)
+    
+    # Test put-call parity: C - P = S - K*e^(-rT)
+    pcp_test_cases = [
+        {'S': 100, 'K': 100, 'T': 1.0, 'r': 0.05, 'sigma': 0.20},
+        {'S': 110, 'K': 100, 'T': 0.5, 'r': 0.03, 'sigma': 0.30},
+        {'S': 90, 'K': 100, 'T': 0.25, 'r': 0.04, 'sigma': 0.15},
+    ]
+    
+    pcp_passed = True
+    for i, params in enumerate(pcp_test_cases, 1):
+        call = black_scholes_price(**params, option_type='call')
+        put = black_scholes_price(**params, option_type='put')
+        
+        lhs = call - put
+        rhs = params['S'] - params['K'] * np.exp(-params['r'] * params['T'])
+        diff = abs(lhs - rhs)
+        
+        passed = diff < 0.01
+        status = "✓ PASS" if passed else "✗ FAIL"
+        
+        print(f"\n{status} - PCP Test {i} (S={params['S']}, K={params['K']}, T={params['T']})")
+        print(f"  C - P = {lhs:.4f}")
+        print(f"  S - K*e^(-rT) = {rhs:.4f}")
+        print(f"  Difference: {diff:.6f}")
+        
+        if not passed:
+            pcp_passed = False
+            all_passed = False
+    
+    print("\n" + "="*60)
     if all_passed:
-        print("✓ ALL TESTS PASSED - Pricer is working correctly!")
+        print("✓✓✓ ALL TESTS PASSED - Pricer is working correctly! ✓✓✓")
     else:
         print("✗ SOME TESTS FAILED - Review your implementation")
     print("="*60)
