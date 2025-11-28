@@ -15,7 +15,7 @@ import numpy as np
 from scipy.stats import norm
 from scipy.optimize import newton
 from typing import Literal
-from src.pricer import black_scholes_price, moneyness
+from pricer import black_scholes_price, moneyness
 
 
 def delta(
@@ -135,11 +135,16 @@ def gamma(
         changes very rapidly near the strike. This makes ATM options 
         near expiry very difficult to hedge.
     """
-    # TODO: Implement gamma calculation
-    # Hint: Use norm.pdf(d1) for the normal probability density
-    # Remember to handle T = 0 case
-    pass
+    # Handle expiration cases
+    if T == 0:
+        return 0 if moneyness(S, K, option_type) != 'ATM' else 1e6
 
+    # Calculate d1
+    denom = sigma* np.sqrt(T)
+    d_1_num = np.log(S / K) + (r + (sigma ** 2) / 2) * T
+    d1 = d_1_num / denom if denom != 0 else 0
+    
+    return norm.pdf(d1) / (S * sigma * np.sqrt(T))
 
 def vega(
     S: float,
@@ -192,11 +197,15 @@ def vega(
         sell when vol is high, you can profit from vega even if the 
         stock doesn't move. This is called "vol trading."
     """
-    # TODO: Implement vega calculation
-    # Hint: Very similar to gamma, uses norm.pdf(d1)
-    # Note: Some sources return vega/100 (per 1% vol), others per 100% vol
-    # We'll use per 1% (divide by 100)
-    pass
+    if T == 0:
+        return 0
+
+    # Calculate d1
+    denom = sigma* np.sqrt(T)
+    d_1_num = np.log(S / K) + (r + (sigma ** 2) / 2) * T
+    d1 = d_1_num / denom if denom != 0 else 0
+
+    return (S * np.sqrt(T) * norm.pdf(d1)) / 100
 
 
 def theta(
@@ -252,10 +261,24 @@ def theta(
         for the stock to move, so the option's time value decays. This 
         accelerates near expiration (gamma risk).
     """
-    # TODO: Implement theta calculation
-    # Hint: This one is more complex, watch your signs!
     # Theta is usually expressed per day, so divide annual theta by 365
-    pass
+    if T == 0:
+        return 0
+    
+    # Calculate d1 and d2
+    denom = sigma* np.sqrt(T)
+    d_1_num = np.log(S / K) + (r + (sigma ** 2) / 2) * T
+    d1 = d_1_num / denom if denom != 0 else 0
+    d2 = d1 - sigma * np.sqrt(T)
+
+    # Calculate option value and cost
+    op_val = S * norm.pdf(d1) * sigma / (2 * np.sqrt(T))
+    op_cost = r * K * np.exp(-r * T)
+
+    if option_type == 'call':
+        return (-op_val - op_cost * norm.cdf(d2)) / 365
+    if option_type == 'put':
+        return (-op_val + op_cost * norm.cdf(-d2)) / 365
 
 
 def rho(
@@ -314,7 +337,20 @@ def rho(
     # TODO: Implement rho calculation
     # Hint: Use np.exp(-r*T) for discounting
     # Rho is usually expressed per 1% rate change (divide by 100)
-    pass
+    if T == 0:
+        return 0
+
+    # Calculate d1 and d2
+    denom = sigma* np.sqrt(T)
+    d_1_num = np.log(S / K) + (r + (sigma ** 2) / 2) * T
+    d1 = d_1_num / denom if denom != 0 else 0
+    d2 = d1 - sigma * np.sqrt(T)
+
+    if option_type == 'call':
+        return (K * T * np.exp(-r * T) * norm.cdf(d2)) / 100
+    
+    if option_type == 'put':
+        return (-K * T * np.exp(-r * T) * norm.cdf(-d2)) / 100
 
 
 def implied_volatility(
