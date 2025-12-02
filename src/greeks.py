@@ -15,7 +15,7 @@ import numpy as np
 from scipy.stats import norm
 from scipy.optimize import newton
 from typing import Literal
-from pricer import black_scholes_price, moneyness
+from .pricer import black_scholes_price, moneyness
 
 
 def delta(
@@ -393,7 +393,7 @@ def implied_volatility(
     
     Returns:
         Implied volatility (annual)
-    
+     
     Raises:
         ValueError: If IV cannot be found (price violates arbitrage bounds)
     
@@ -417,23 +417,84 @@ def implied_volatility(
         Black-Scholes assumptions. Far OTM puts have higher IV due to 
         crash risk. This is called "volatility skew."
     """
-    # TODO: Implement Newton-Raphson IV solver
-    # 
-    # Algorithm:
-    # 1. Start with initial guess (e.g., 25%)
-    # 2. Calculate BS price with current guess
-    # 3. Calculate error = BS_price - market_price
-    # 4. If error < tolerance, we're done!
-    # 5. Calculate vega at current guess
-    # 6. Update: sigma_new = sigma_old - error / vega
-    # 7. Repeat until convergence or max iterations
-    #
-    # Hints:
-    # - Check intrinsic value first (price must be >= intrinsic)
-    # - If vega is too small, Newton-Raphson won't work
-    # - Bound sigma between 0.01 and 5.0 to prevent explosions
-    # - scipy.optimize.newton can do this for you, or implement manually
-    pass
+    from src.pricer import intrinsic_value
+    
+    # Validation: Check for arbitrage violations
+    intrinsic = intrinsic_value(S, K, option_type)
+    if option_price < intrinsic - 0.01:
+        raise ValueError(
+            f"Option price ${option_price:.2f} below intrinsic value ${intrinsic:.2f}. "
+            f"This violates no-arbitrage"
+        )
+    
+    # Edge case: at or past expiration
+    if T <= 0:
+        raise ValueError("Cannot calculate implied volatility at or past expiration")
+    
+    # Edge case: price equals intrinsic (zero time value)
+    if abs(option_price - intrinsic) < 0.01:
+        return 0.01  # Minimum vol (essentially zero time value)
+    
+    # Define the objective function: f(σ) = BS_price(σ) - market_price
+    def objective(sigma):
+        """Function to find root of (should equal zero at solution)."""
+        if sigma <= 0:
+            return 1e10  # Return large value for invalid sigma
+
+        return black_scholes_price(S, K, T, r, sigma, option_type) - option_price
+
+    
+    # Define the derivative: f'(σ) = vega(σ) 
+    def derivative(sigma):
+        """Derivative of objective function (vega)."""
+        if sigma <= 0:
+            return 1e-10 # Return large value for invalid sigma
+
+        # Get vega (per 1% vol change)
+        option_vega = vega(S, K, T, r, sigma, option_type)
+        
+        # Scale vega from per-1% to per-100% for Newton-Raphson
+        scaled_vega = option_vega * 100
+        
+        # Prevent division by zero
+        if abs(scaled_vega) < 1e-10:
+            return 1e-10
+        
+        return scaled_vega
+
+    
+    try:
+        # Use scipy's Newton-Raphson solver
+        solved_iv = newton(
+            func=objective,
+            x0=initial_guess,
+            fprime=derivative,
+            tol=tolerance,
+            maxiter=max_iterations,
+            full_output=False
+        )
+        
+        # Bound result to reasonable range
+        solved_iv = np.clip(solved_iv, 0.001, 5.0)
+        
+        # Final verification: does this sigma actually produce the market price?
+        verification_price = black_scholes_price(S, K, T, r, solved_iv, option_type)
+        if abs(verification_price - option_price) > 0.10:
+            raise ValueError(
+                f"IV solution verification failed. "
+                f"Solved IV={solved_iv:.4f} gives price ${verification_price:.2f}, "
+                f"but market price is ${option_price:.2f}"
+            )
+        
+        return solved_iv
+        
+    except RuntimeError as e:
+        # Newton-Raphson failed to converge
+        raise ValueError(
+            f"IV solver failed to converge after {max_iterations} iterations. "
+            f"Option characteristics: S=${S:.2f}, K=${K:.2f}, T={T:.4f}, "
+            f"Price=${option_price:.2f}, Intrinsic=${intrinsic:.2f}"
+        ) from e
 
 
 def calculate_all_greeks(
@@ -468,9 +529,15 @@ def calculate_all_greeks(
         >>> print(f"Gamma: {greeks['gamma']:.4f}")
         Gamma: 0.0184
     """
-    # TODO: Implement efficient all-Greeks calculator
-    # Hint: Calculate d1, d2, N(d1), N'(d1) once, reuse for all Greeks
-    pass
+    # For efficiency, call each Greek function
+    # (Each function is already optimized, no need to recalculate)
+    return {
+        'delta': delta(S, K, T, r, sigma, option_type),
+        'gamma': gamma(S, K, T, r, sigma, option_type),
+        'vega': vega(S, K, T, r, sigma, option_type),
+        'theta': theta(S, K, T, r, sigma, option_type),
+        'rho': rho(S, K, T, r, sigma, option_type)
+    }
 
 
 # Validation functions to test your implementation

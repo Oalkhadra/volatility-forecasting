@@ -302,7 +302,7 @@ class TestGreeksNumericalProperties:
         S, K, T, r, sigma, opt_type = 100, 100, 1.0, 0.05, 0.20, 'call'
         
         # Analytical vega
-        analytical_vega = vega(S, K, T, r, sigma, opt_type)
+        analytical_vega = vega(S, K, T, r, sigma, opt_type) * 100
         
         # Numerical vega: (Price(σ+h) - Price(σ-h)) / (2h)
         # Note: our vega is per 1% vol, so we need to scale

@@ -23,6 +23,7 @@ Where:
 import numpy as np
 from scipy.stats import norm
 from typing import Union, Literal
+from tqdm import tqdm
 
 
 def black_scholes_price(
