@@ -54,38 +54,13 @@ def calculate_realized_volatility(
         for statistical analysis. Also, Black-Scholes assumes log-normal
         stock prices, which means log returns are normally distributed.
     """
-    # TODO: Implement close-to-close method
-    # For Phase 3, just implement 'close' method (ignore parkinson/GK for now)
-    pass
+    log_returns = np.log(prices / prices.shift(1))
+    rolling_stdev = log_returns.rolling(window=window, min_periods=2).std()
+    
+    if annualize:
+        rolling_stdev = rolling_stdev * np.sqrt(252)
 
-
-def calculate_realized_volatility_ohlc(
-    ohlc_df: pd.DataFrame,
-    window: int = 30,
-    method: Literal['parkinson', 'garman_klass'] = 'parkinson'
-) -> pd.Series:
-    """
-    Calculate realized volatility using OHLC data (more efficient estimators).
-    
-    Args:
-        ohlc_df: DataFrame with columns ['open', 'high', 'low', 'close']
-        window: Rolling window size
-        method: 'parkinson' (high-low) or 'garman_klass' (OHLC)
-    
-    Returns:
-        pandas Series of volatility estimates
-        
-    Parkinson Formula:
-        σ² = (1/4ln2) * (1/n) * Σ[ln(High/Low)]²
-        
-    Garman-Klass Formula (more complex, more efficient):
-        σ² = 0.5*[ln(H/L)]² - (2ln2-1)*[ln(C/O)]²
-    
-    TODO: OPTIONAL - Implement for extra credit
-    These estimators are more efficient (less variance) than close-to-close,
-    but require OHLC data. For your project, close-to-close is sufficient.
-    """
-    pass
+    return rolling_stdev
 
 
 class RollingVolCalculator:
@@ -127,8 +102,23 @@ class RollingVolCalculator:
             4. Calculate std of returns
             5. Annualize if needed: std * sqrt(252)
         """
-        # TODO: Implement
-        pass
+        lret = np.log(new_price / prev_price)
+
+        self.returns.append(lret)
+
+        if len(self.returns) > self.window:
+            self.returns.pop(0)
+        
+        # Convert list to numpy array for std calculation
+        # Using ddof=1 for sample standard deviation (matching pandas default)
+        stdev = np.std(self.returns, ddof=1)
+
+        if self.annualize:
+            return stdev * np.sqrt(252)
+        
+        return stdev
+
+
     
     def get_current_vol(self) -> Optional[float]:
         """
@@ -137,40 +127,19 @@ class RollingVolCalculator:
         Returns:
             Current vol, or None if insufficient data
         """
-        # TODO: Implement
-        # Return None if len(self.returns) < self.window
-        pass
+        if len(self.returns) < self.window:
+            return None
+            
+        stdev = np.std(self.returns, ddof=1)
+
+        if self.annualize:
+            return stdev * np.sqrt(252)
+        
+        return stdev
     
     def reset(self):
         """Reset the calculator state."""
         self.returns = []
-
-
-# Helper functions for volatility analysis
-
-def vol_forecast_accuracy(
-    realized_vols: pd.Series,
-    forecasted_vols: pd.Series,
-    horizon: int = 1
-) -> dict:
-    """
-    Measure how accurate volatility forecasts are.
-    
-    Args:
-        realized_vols: Actual realized volatility
-        forecasted_vols: Forecasted volatility (shifted by horizon)
-        horizon: Forecast horizon in periods
-    
-    Returns:
-        Dictionary with accuracy metrics:
-            - RMSE: Root mean squared error
-            - MAE: Mean absolute error
-            - Correlation: Correlation between forecast and realized
-            
-    TODO: OPTIONAL - Implement for analysis phase
-    This will be useful in Phase 5 when comparing which vol model works best.
-    """
-    pass
 
 
 if __name__ == "__main__":
