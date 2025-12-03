@@ -1,114 +1,117 @@
-# Phase 4: Backtesting Engine - Mispricing Strategy
+# Phase 4: Backtesting Engine - Updated with Daily Rebalancing
 
-## 🎯 Your Strategy (Clarified)
+## 🎯 Strategy Overview
 
-You are implementing a **Relative Value / Statistical Arbitrage** strategy:
+**Weekly Options Trading + Daily Delta Rebalancing**
 
-1. **Weekly Rebalancing** (Sunday): Review all available options
-2. **Theoretical Pricing**: Calculate "fair" price using your vol model (GARCH/ML/Historical/Surface)
-3. **Mispricing Detection**: Compare theo price vs. market price
-   - If `market_price > theo_price * (1 + threshold)` → **SELL** (overpriced)
-   - If `market_price < theo_price * (1 - threshold)` → **BUY** (underpriced)
-4. **Delta Hedging**: For each option position, trade stock to neutralize delta
-5. **Hold to Expiry**: No intra-week rebalancing
-6. **Settlement**:
-   - ITM options: Realize intrinsic value
-   - OTM options: Expire worthless
+### Weekly (Saturdays/Sundays):
+1. Handle expiries from previous week
+2. Calculate theoretical prices using vol model
+3. Find mispriced options (theo vs. market)
+4. Execute option trades
+5. Execute initial delta hedges
 
-## 🏗 Architecture
+### Daily (Mon-Fri):
+1. Mark all positions to market
+2. Recalculate option deltas
+3. Rebalance stock hedge to maintain delta-neutrality
+4. Log PnL
 
-### Key Components
+## 💰 Transaction Costs
 
-1. **`Portfolio`**: 
-   - Tracks cash and positions (options + stock hedge)
-   - Handles trade execution
-   - Manages option expiries
+**Options:** $0.50 per contract  
+**Stock:** 1 basis point (0.01%) of notional
 
-2. **`MispricingStrategy`**:
-   - Takes a vol model as input
-   - Calculates theo prices
-   - Generates buy/sell signals based on mispricing
-   - Generates delta-hedge trades
+These are realistic retail execution costs and will help determine if the strategy is economically viable.
 
-3. **`BacktestEngine`**:
-   - Steps through weeks
-   - Handles expiries
-   - Executes strategy signals
-   - Logs PnL
+## 🏗 Implementation Status
 
-### Position Keying
+### ✅ Portfolio Class (COMPLETE)
+- [x] `execute_trade()` - Handles trades with transaction costs
+- [x] `mark_to_market()` - Updates position values daily
+- [x] `handle_expiries()` - Settles ITM/OTM options
+- [x] `get_portfolio_delta()` - Calculates total delta
 
-Options need unique identifiers:
-```python
-"SPY_290C_20190621"  # SPY, $290 Call, June 21 2019
-```
+### 📝 BacktestEngine Class (TODO)
+- [ ] `load_data()` - Load options and daily prices
+- [ ] `rebalance_delta()` - Daily hedge rebalancing
+- [ ] `run()` - Main weekly/daily loop
 
-This prevents collisions between different strikes/expiries.
-
-## 📊 Phase 5 Preview
-
-You'll run **4 separate backtests**:
-1. Strategy B: Historical Vol model
-2. Strategy C: Vol Surface model
-3. Strategy D (GARCH): GARCH forecasting
-4. Strategy D (ML): XGBoost forecasting
-
-Each produces an equity curve. Phase 5 compares them.
-
-## 🛠 Implementation Tasks
-
-### 1. `Portfolio` Class
-- [x] `execute_trade()` - Process trades and update positions
-- [ ] `mark_to_market()` - Update position values
-- [ ] `handle_expiries()` - Settle expired options
-
-### 2. `MispricingStrategy` Class
+### 📝 MispricingStrategy Class (TODO)
 - [ ] `calculate_theo_price()` - Get vol from model, price with BS
 - [ ] `generate_signals()` - Find mispricings, create signals
 
-### 3. `BacktestEngine` Class
-- [ ] `load_data()` - Load options and prices
-- [ ] `run()` - Main weekly loop
+## 🔄 Backtest Loop Structure
 
-## 💡 Key Concepts
-
-### Delta Hedging Example
-- Sell 1 SPY $290 Call (delta = 0.60)
-- Hedge: Buy 60 shares of SPY
-- Net delta ≈ 0 (market-neutral)
-
-### Expiry PnL
-**Long Call Example:**
-- Buy 1 SPY $290 Call @ $5.00 (cost = $500)
-- At expiry, SPY = $295
-- Intrinsic = max(0, 295 - 290) = $5
-- Settlement: Receive $500
-- Net PnL = $0 (breakeven)
-
-**Short Put Example:**
-- Sell 1 SPY $290 Put @ $3.00 (credit = $300)
-- At expiry, SPY = $285
-- Intrinsic = max(0, 290 - 285) = $5
-- Settlement: Pay $500
-- Net PnL = -$200 (loss)
-
-## 📂 File Structure
-
+```python
+for week_date in trading_saturdays:
+    # WEEKLY: New option positions
+    handle_expiries()
+    signals = strategy.generate_signals()
+    execute_option_trades(signals)
+    execute_initial_hedges(signals)
+    
+    # DAILY: Rebalance loop
+    for day in get_weekdays(week_date):
+        mark_to_market()
+        rebalance_delta()  # <-- NEW
+        log_pnl()
 ```
-src/backtest/
-├── __init__.py
-├── engine.py       # Portfolio, BacktestEngine
-└── strategy.py     # MispricingStrategy
-```
+
+## 📊 Expected Output
+
+The backtest will produce a DataFrame with columns:
+- `date`: Daily timestamps
+- `equity`: Total portfolio value
+- `cash`: Cash balance
+- `num_positions`: Number of open positions
+- (Optional) `delta`: Portfolio delta after rebalancing
 
 ## 🚀 Next Steps
 
-Start implementing the TODOs in order:
-1. `Portfolio.execute_trade()` ✅ (Done)
-2. `Portfolio.mark_to_market()`
-3. `Portfolio.handle_expiries()`
-4. `MispricingStrategy.calculate_theo_price()`
-5. `MispricingStrategy.generate_signals()`
-6. `BacktestEngine.load_data()`
-7. `BacktestEngine.run()`
+1. **Implement `BacktestEngine.load_data()`**
+   - Load `spy_options.parquet` and `spy_prices.parquet`
+   - Filter by date range
+   - Prepare for iteration
 
+2. **Implement `BacktestEngine.rebalance_delta()`**
+   - Calculate portfolio delta
+   - Determine required stock hedge
+   - Execute rebalance trade
+
+3. **Implement `BacktestEngine.run()`**
+   - Outer loop: Weekly trading
+   - Inner loop: Daily rebalancing
+   - Return results DataFrame
+
+4. **Implement `MispricingStrategy`**
+   - Calculate theo prices
+   - Generate signals
+   - Create delta-hedge trades
+
+## 💡 Key Design Decisions
+
+### Why Daily Rebalancing?
+- More realistic (market makers rebalance continuously)
+- Isolates vol edge from delta drift
+- You have daily data (no extra burden)
+
+### Why Transaction Costs?
+- Tests economic viability
+- Prevents overfitting to noise
+- Realistic for interviews
+
+### Why Weekly Options Trading?
+- Matches your data frequency (Saturday snapshots)
+- Reduces noise from intraweek volatility
+- Focuses on persistent mispricings
+
+## 📂 Files
+
+- `src/backtest/engine.py` - Portfolio and BacktestEngine ✅
+- `src/backtest/strategy.py` - MispricingStrategy 📝
+- `PHASE_4_GUIDE.md` - This file
+
+---
+
+**You're ready to start implementing!** The Portfolio class is complete and tested. Now build the engine loop and strategy logic.

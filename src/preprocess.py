@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional, List
 from io import StringIO
 import yfinance as yf
-from risk_free_rate import get_risk_free_rate
+from .pricing.risk_free_rate import get_risk_free_rate
 
 # Constants
 DOLT_REPO_PATH = "data/raw/options"
