@@ -6,11 +6,22 @@ theoretical pricing vs. market pricing.
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional, Union
 from dataclasses import dataclass
 import pandas as pd
 import numpy as np
 from datetime import datetime
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from pricing.pricer import black_scholes_price
+from pricing.greeks import calculate_all_greeks
+from volatility.forecasting import GARCHForecaster, MLForecaster
+from volatility.surface import VolatilitySurface
+from backtest.engine import Trade
 
 @dataclass
 class TradeSignal:
@@ -20,6 +31,7 @@ class TradeSignal:
     quantity: int            # Number of contracts
     market_price: float
     theo_price: float
+    mispricing_pct: float    # (market - theo) / theo
     
     # Option metadata
     strike: float
@@ -29,6 +41,11 @@ class TradeSignal:
     # Delta hedge info
     delta: float
     hedge_quantity: float    # Shares of stock to trade
+    
+    # Additional metadata for analysis
+    timestamp: datetime
+    underlying_price: float
+    dte: float               # Days to expiry
 
 class BaseStrategy(ABC):
     """Abstract base class for all strategies."""
@@ -38,7 +55,8 @@ class BaseStrategy(ABC):
                         portfolio, 
                         options_snapshot: pd.DataFrame,
                         underlying_price: float,
-                        current_date: datetime) -> List[TradeSignal]:
+                        current_date: datetime,
+                        risk_free_rate: float) -> List[TradeSignal]:
         """
         Core logic: Compare theo vs market, generate trades.
         
@@ -47,9 +65,24 @@ class BaseStrategy(ABC):
             options_snapshot: DataFrame of available options for this date
             underlying_price: Current SPY price
             current_date: Current date
+            risk_free_rate: Current risk-free rate
             
         Returns:
             List of TradeSignal objects
+        """
+        pass
+    
+    @abstractmethod
+    def create_trade_from_signal(self, signal: TradeSignal, trade_type: str) -> Trade:
+        """
+        Convert a TradeSignal to a Trade object.
+        
+        Args:
+            signal: TradeSignal to convert
+            trade_type: 'option' or 'stock' (for hedge)
+            
+        Returns:
+            Trade object ready for execution
         """
         pass
 
@@ -64,21 +97,31 @@ class MispricingStrategy(BaseStrategy):
            - market > theo → SELL (overpriced)
            - market < theo → BUY (underpriced)
         4. For each option trade, generate delta-hedge stock trade
+        
+    Interview Tips:
+        - Explain why delta-neutral: Isolates vol bet from directional exposure
+        - Discuss transaction costs: Options are expensive ($0.50/contract)
+        - Risk management: Max positions limit prevents over-concentration
     """
     
     def __init__(self, 
                  vol_model,
+                 returns_data: Optional[pd.Series] = None,
                  threshold: float = 0.10,
                  max_positions: int = 5,
                  contracts_per_trade: int = 1):
         """
+        Initialize mispricing strategy.
+        
         Args:
             vol_model: Volatility forecasting model (GARCH, ML, Historical, or Surface)
+            returns_data: Historical returns for ML/GARCH models (optional)
             threshold: Minimum mispricing % to trade (e.g., 0.10 = 10%)
             max_positions: Maximum number of option positions to hold
             contracts_per_trade: Number of contracts per trade
         """
         self.vol_model = vol_model
+        self.returns_data = returns_data
         self.threshold = threshold
         self.max_positions = max_positions
         self.contracts_per_trade = contracts_per_trade
@@ -89,43 +132,244 @@ class MispricingStrategy(BaseStrategy):
                             K: float, 
                             T: float, 
                             r: float, 
-                            option_type: str) -> float:
+                            option_type: str,
+                            current_date: datetime = None) -> float:
         """
         Calculate theoretical option price using the vol model.
         
-        TODO: Implement theo pricing
+        This is the CORE of the strategy - getting accurate vol forecasts
+        and pricing options with them.
         
+        Args:
+            S: Current underlying price
+            K: Strike price
+            T: Time to expiration (years)
+            r: Risk-free rate
+            option_type: 'call' or 'put'
+            current_date: Current date (for filtering returns if needed)
+            
+        Returns:
+            Theoretical option price
+            
+        TODO: IMPLEMENT THIS METHOD
+        
+        Steps:
+            1. Get volatility forecast from self.vol_model
+               - Handle 4 different model types:
+                 a) GARCHForecaster: Call .forecast(horizon) with DTE in days
+                 b) MLForecaster: Call .forecast(returns) with historical returns
+                 c) VolatilitySurface: Call .get_vol(K, S, dte, option_type)
+                 d) Simple float or callable: Use directly or call with (S, K, T)
+                 
+            2. Calculate theoretical price using Black-Scholes
+               - Use: black_scholes_price(S, K, T, r, sigma, option_type)
+               
+            3. Return the theoretical price
+            
         Hints:
-            1. Get vol forecast from self.vol_model
-            2. Use black_scholes_price() with forecasted vol
-            3. Return theo price
+            - Use isinstance() to check model type
+            - For GARCH: horizon = days to expiry (T * 365)
+            - For ML: Pass self.returns_data up to current_date
+            - Handle edge cases: T=0, invalid vol (< 0 or > 2)
+            - Consider caching forecasts if same date/model called multiple times
+            
+        Interview Question: "How do different vol models affect pricing?"
+            - GARCH: Captures vol clustering, mean reversion
+            - ML: Non-linear patterns, learns from multiple features
+            - Surface: Market's implied view (benchmark)
+            - Historical: Naive baseline, assumes stationary vol
         """
-        pass
+        # TODO: YOUR CODE HERE
+        raise NotImplementedError("TODO: Implement calculate_theo_price()")
     
     def generate_signals(self, 
                         portfolio, 
                         options_snapshot: pd.DataFrame,
                         underlying_price: float,
-                        current_date: datetime) -> List[TradeSignal]:
+                        current_date: datetime,
+                        risk_free_rate: float) -> List[TradeSignal]:
         """
         Generate trading signals based on mispricing.
         
-        TODO: Implement signal generation
+        This is the DECISION LOGIC - which options to trade and in what direction.
+        
+        Args:
+            portfolio: Current Portfolio object
+            options_snapshot: DataFrame with columns:
+                - strike, expiry_date, call_put, mid_price, underlying_price, days_to_expiry
+            underlying_price: Current SPY price
+            current_date: Current date
+            risk_free_rate: Risk-free rate
+            
+        Returns:
+            List of TradeSignal objects (sorted by best opportunities)
+            
+        TODO: IMPLEMENT THIS METHOD
         
         Structure:
-            1. Check if we're at max positions (skip if so)
-            2. For each option in options_snapshot:
-               a. Calculate theo price
-               b. Get market price (mid or ask/bid)
-               c. Calculate mispricing = (market - theo) / theo
-               d. If abs(mispricing) > threshold:
-                  - Create TradeSignal
-                  - Calculate delta for hedge
-            3. Sort by abs(mispricing) descending
-            4. Return top N signals (up to max_positions limit)
+            1. Check current positions
+               - Count option positions in portfolio
+               - If at max_positions, return empty list (no new trades)
+               - Calculate how many new positions we can add
+               
+            2. Loop through options_snapshot
+               For each option:
+                 a. Extract option parameters (S, K, T, option_type)
+                 b. Calculate theoretical price using calculate_theo_price()
+                 c. Get market price from 'mid_price' column
+                 d. Calculate mispricing_pct = (market - theo) / theo
+                 e. If abs(mispricing_pct) > self.threshold:
+                    - Determine action: 
+                      * market > theo → SELL (overpriced)
+                      * market < theo → BUY (underpriced)
+                    - Calculate delta using calculate_all_greeks()
+                    - Calculate hedge_quantity = -delta * contracts * 100
+                    - Create TradeSignal object
+                    - Add to signals list
+                    
+            3. Sort signals by abs(mispricing_pct) descending
+               - Want to trade the MOST mispriced options first
+               
+            4. Return top N signals
+               - N = max_positions - current_option_positions
+               - Don't exceed max_positions limit
+               
+        Hints:
+            - Convert days_to_expiry to years: T = dte / 365.0
+            - Handle expiry_date as datetime or timestamp
+            - Use try/except for pricing errors (e.g., bad IV)
+            - Filter out options with very low liquidity if needed
+            - Consider min DTE filter (e.g., skip if DTE < 1 day)
+            
+        Data Schema Reminder:
+            options_snapshot columns:
+            - date, strike, expiration, call_put, mid_price, 
+              underlying_price, days_to_expiry
+              
+        Interview Question: "How do you handle edge cases?"
+            - Options near expiry: High gamma risk, avoid if DTE < 2
+            - Wide bid-ask spreads: Might want to skip illiquid options
+            - Extreme mispricing: Could be data error, cap at ±50%
+            - Model errors: Catch exceptions, log warnings, skip option
         """
         signals = []
         
-        # TODO: Implement
+        # TODO: YOUR CODE HERE
+        # Step 1: Check current positions
         
-        return signals
+        # Step 2: Loop through options and find mispricings
+        
+        # Step 3: Sort by mispricing magnitude
+        
+        # Step 4: Return top N signals
+        
+        raise NotImplementedError("TODO: Implement generate_signals()")
+    
+    def create_trade_from_signal(self, signal: TradeSignal, trade_type: str) -> Trade:
+        """
+        Convert a TradeSignal to a Trade object for execution.
+        
+        This handles the conversion from strategy signal to actual trade.
+        
+        Args:
+            signal: TradeSignal object with trade details
+            trade_type: 'option' or 'stock'
+                - 'option': Create option trade from signal
+                - 'stock': Create delta hedge trade
+                
+        Returns:
+            Trade object ready for portfolio.execute_trade()
+            
+        TODO: IMPLEMENT THIS METHOD
+        
+        Structure:
+            if trade_type == 'option':
+                - symbol = signal.symbol (e.g., 'SPY')
+                - quantity = signal.quantity (positive for buy, negative for sell)
+                  * If action='buy': quantity = +self.contracts_per_trade
+                  * If action='sell': quantity = -self.contracts_per_trade
+                - price = signal.market_price
+                - Include option metadata: strike, expiry, option_type
+                
+            elif trade_type == 'stock':
+                - symbol = signal.symbol (e.g., 'SPY')
+                - quantity = signal.hedge_quantity (calculated from delta)
+                - price = signal.underlying_price
+                - No option metadata (set to None)
+                
+        Hints:
+            - Trade dataclass from engine.py requires:
+              Trade(symbol, quantity, price, trade_type, timestamp,
+                    strike=None, expiry=None, option_type=None)
+            - Hedge quantity is OPPOSITE of option delta exposure
+              * Long call (+delta) → Short stock (negative quantity)
+              * Short call (-delta) → Long stock (positive quantity)
+            - Use signal.timestamp for trade timestamp
+            
+        Interview Question: "Why delta hedge immediately?"
+            We want to isolate our vol bet from directional exposure.
+            If we buy a call thinking it's underpriced due to low implied vol,
+            we don't want to also bet on the stock going up. Delta hedging
+            neutralizes the directional exposure so PnL comes purely from
+            vol forecast accuracy. This is a market-neutral strategy.
+        """
+        # TODO: YOUR CODE HERE
+        raise NotImplementedError("TODO: Implement create_trade_from_signal()")
+
+
+# ============================================================================
+# HELPER FUNCTIONS FOR STRATEGY ANALYSIS
+# ============================================================================
+
+def count_option_positions(portfolio) -> int:
+    """
+    Count number of option positions in portfolio.
+    
+    Helper function for position management.
+    
+    Args:
+        portfolio: Portfolio object from engine.py
+        
+    Returns:
+        Number of option positions (not stock positions)
+        
+    TODO: IMPLEMENT THIS (EASY)
+    
+    Hint: Loop through portfolio.positions, count where position_type == 'option'
+    """
+    # TODO: YOUR CODE HERE
+    return 0
+
+
+def calculate_signal_quality_metrics(signals: List[TradeSignal]) -> Dict[str, float]:
+    """
+    Calculate metrics about signal quality for analysis.
+    
+    This is OPTIONAL but useful for Phase 5 analysis.
+    
+    Args:
+        signals: List of TradeSignal objects
+        
+    Returns:
+        Dict with metrics:
+            - avg_mispricing: Average absolute mispricing
+            - max_mispricing: Largest mispricing
+            - avg_delta: Average absolute delta
+            - num_calls: Number of call signals
+            - num_puts: Number of put signals
+            - num_buys: Number of buy signals
+            - num_sells: Number of sell signals
+    """
+    if not signals:
+        return {
+            'avg_mispricing': 0.0,
+            'max_mispricing': 0.0,
+            'avg_delta': 0.0,
+            'num_calls': 0,
+            'num_puts': 0,
+            'num_buys': 0,
+            'num_sells': 0
+        }
+    
+    # TODO: OPTIONAL - Implement for analysis
+    pass

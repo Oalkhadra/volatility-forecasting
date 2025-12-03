@@ -15,7 +15,7 @@ import numpy as np
 from scipy.stats import norm
 from scipy.optimize import newton
 from typing import Literal
-from .pricer import black_scholes_price, moneyness
+from .pricer import black_scholes_price, moneyness, intrinsic_value
 
 
 def delta(
@@ -361,7 +361,7 @@ def implied_volatility(
     r: float,
     option_type: Literal['call', 'put'],
     initial_guess: float = 0.25,
-    max_iterations: int = 100,
+    max_iterations: int = 10,
     tolerance: float = 1e-6
 ) -> float:
     """
@@ -417,7 +417,6 @@ def implied_volatility(
         Black-Scholes assumptions. Far OTM puts have higher IV due to 
         crash risk. This is called "volatility skew."
     """
-    from src.pricer import intrinsic_value
     
     # Validation: Check for arbitrage violations
     intrinsic = intrinsic_value(S, K, option_type)
