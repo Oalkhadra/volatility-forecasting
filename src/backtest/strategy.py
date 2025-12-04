@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Tuple, Optional, Union
 from dataclasses import dataclass
 import pandas as pd
+from tqdm import tqdm
 import numpy as np
 from datetime import datetime
 import sys
@@ -17,11 +18,11 @@ import os
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pricing.pricer import black_scholes_price
-from pricing.greeks import calculate_all_greeks
-from volatility.forecasting import GARCHForecaster, MLForecaster
-from volatility.surface import VolatilitySurface
-from backtest.engine import Trade
+from ..pricing.pricer import black_scholes_price, intrinsic_value
+from ..pricing.greeks import delta, calculate_all_greeks
+from ..volatility.forecasting import GARCHForecaster, MLForecaster
+from ..volatility.surface import VolatilitySurface
+from ..backtest.engine import Trade
 
 @dataclass
 class TradeSignal:
@@ -115,14 +116,13 @@ class MispricingStrategy(BaseStrategy):
         
         Args:
             vol_model: Volatility forecasting model (GARCH, ML, Historical, or Surface)
-            returns_data: Historical returns for ML/GARCH models (optional)
             threshold: Minimum mispricing % to trade (e.g., 0.10 = 10%)
             max_positions: Maximum number of option positions to hold
             contracts_per_trade: Number of contracts per trade
         """
         self.vol_model = vol_model
-        self.returns_data = returns_data
         self.threshold = threshold
+        self.returns_data = returns_data
         self.max_positions = max_positions
         self.contracts_per_trade = contracts_per_trade
         self.model_name = vol_model.__class__.__name__
@@ -133,26 +133,20 @@ class MispricingStrategy(BaseStrategy):
                             T: float, 
                             r: float, 
                             option_type: str,
-                            current_date: datetime = None) -> float:
+                            returns_data: Optional[pd.Series] = None) -> Tuple[float, float]:
         """
         Calculate theoretical option price using the vol model.
-        
-        This is the CORE of the strategy - getting accurate vol forecasts
-        and pricing options with them.
-        
+
         Args:
             S: Current underlying price
             K: Strike price
             T: Time to expiration (years)
             r: Risk-free rate
             option_type: 'call' or 'put'
-            current_date: Current date (for filtering returns if needed)
             
         Returns:
             Theoretical option price
-            
-        TODO: IMPLEMENT THIS METHOD
-        
+
         Steps:
             1. Get volatility forecast from self.vol_model
                - Handle 4 different model types:
@@ -170,29 +164,37 @@ class MispricingStrategy(BaseStrategy):
             - Use isinstance() to check model type
             - For GARCH: horizon = days to expiry (T * 365)
             - For ML: Pass self.returns_data up to current_date
-            - Handle edge cases: T=0, invalid vol (< 0 or > 2)
             - Consider caching forecasts if same date/model called multiple times
-            
-        Interview Question: "How do different vol models affect pricing?"
-            - GARCH: Captures vol clustering, mean reversion
-            - ML: Non-linear patterns, learns from multiple features
-            - Surface: Market's implied view (benchmark)
-            - Historical: Naive baseline, assumes stationary vol
         """
-        # TODO: YOUR CODE HERE
-        raise NotImplementedError("TODO: Implement calculate_theo_price()")
-    
+        # If at, or very near, expiration, return intrinsic value. It won't matter
+        if T < 1e-6:
+            return intrinsic_value(S=S,K=K,option_type=option_type)
+
+        if isinstance(self.vol_model, VolatilitySurface):
+            sigma = self.vol_model.get_vol(K, S, (T*365)) # Ensure days/years unit is proper!!!!
+        
+        # --------------------------------------------------------------------------------------------- IMPLEMENT OTHER VOL MODELING
+        else: # Use historical volatility if no modeling class is defined
+            sigma = self.vol_model
+
+
+        if sigma < 0:
+            print(f"Warning!! Negative vol produced: {sigma} // Check vol modeling method!")
+
+        # Calculate theoretical price
+        theo = black_scholes_price(S=S,K=K,T=T,r=r, sigma=sigma,option_type=option_type)
+
+        return theo, sigma
+
     def generate_signals(self, 
                         portfolio, 
                         options_snapshot: pd.DataFrame,
                         underlying_price: float,
                         current_date: datetime,
-                        risk_free_rate: float) -> List[TradeSignal]:
+                        risk_free_rate: float = 0.02) -> List[TradeSignal]:
         """
         Generate trading signals based on mispricing.
-        
-        This is the DECISION LOGIC - which options to trade and in what direction.
-        
+             
         Args:
             portfolio: Current Portfolio object
             options_snapshot: DataFrame with columns:
@@ -202,68 +204,76 @@ class MispricingStrategy(BaseStrategy):
             risk_free_rate: Risk-free rate
             
         Returns:
-            List of TradeSignal objects (sorted by best opportunities)
-            
-        TODO: IMPLEMENT THIS METHOD
-        
-        Structure:
-            1. Check current positions
-               - Count option positions in portfolio
-               - If at max_positions, return empty list (no new trades)
-               - Calculate how many new positions we can add
-               
-            2. Loop through options_snapshot
-               For each option:
-                 a. Extract option parameters (S, K, T, option_type)
-                 b. Calculate theoretical price using calculate_theo_price()
-                 c. Get market price from 'mid_price' column
-                 d. Calculate mispricing_pct = (market - theo) / theo
-                 e. If abs(mispricing_pct) > self.threshold:
-                    - Determine action: 
-                      * market > theo → SELL (overpriced)
-                      * market < theo → BUY (underpriced)
-                    - Calculate delta using calculate_all_greeks()
-                    - Calculate hedge_quantity = -delta * contracts * 100
-                    - Create TradeSignal object
-                    - Add to signals list
-                    
-            3. Sort signals by abs(mispricing_pct) descending
-               - Want to trade the MOST mispriced options first
-               
-            4. Return top N signals
-               - N = max_positions - current_option_positions
-               - Don't exceed max_positions limit
-               
-        Hints:
-            - Convert days_to_expiry to years: T = dte / 365.0
-            - Handle expiry_date as datetime or timestamp
-            - Use try/except for pricing errors (e.g., bad IV)
-            - Filter out options with very low liquidity if needed
-            - Consider min DTE filter (e.g., skip if DTE < 1 day)
-            
-        Data Schema Reminder:
-            options_snapshot columns:
-            - date, strike, expiration, call_put, mid_price, 
-              underlying_price, days_to_expiry
-              
-        Interview Question: "How do you handle edge cases?"
-            - Options near expiry: High gamma risk, avoid if DTE < 2
-            - Wide bid-ask spreads: Might want to skip illiquid options
-            - Extreme mispricing: Could be data error, cap at ±50%
-            - Model errors: Catch exceptions, log warnings, skip option
+            List of TradeSignal objects (sorted by 'best' opportunities)
+
         """
         signals = []
         
-        # TODO: YOUR CODE HERE
         # Step 1: Check current positions
+        num_current_positions = len(portfolio.positions)
+
+        if num_current_positions >= self.max_positions:
+            return []
+
+        else:
+            new_position_count = self.max_positions - num_current_positions
+
         
         # Step 2: Loop through options and find mispricings
-        
-        # Step 3: Sort by mispricing magnitude
-        
-        # Step 4: Return top N signals
-        
-        raise NotImplementedError("TODO: Implement generate_signals()")
+        for _, row in tqdm(options_snapshot.iterrows()):
+            # Extract option data
+            symbol = row['act_symbol']
+            option_K = row['strike']
+            option_T = row['days_to_expiry'] / 365
+            option_type = row['call_put']
+            option_bid = row['bid']
+            option_ask = row['ask']
+            option_mid = row['mid_price']
+            option_expiry=row['expiration']
+            option_theo, option_sigma = self.calculate_theo_price(S=underlying_price, 
+                                                    K=option_K,
+                                                    T=option_T,
+                                                    r=risk_free_rate,
+                                                    option_type=option_type)
+            # Calculate mispricing and compare to determined threshold
+            mispricing_pct = (option_mid - option_theo) / option_theo
+
+            if abs(mispricing_pct) > self.threshold:
+                dec = 'sell' if option_mid > option_theo else 'buy'
+                
+                # Calculate delta for hedging
+                option_delta = delta(S=underlying_price, 
+                                     K=option_K,
+                                     T=option_T,
+                                     r=risk_free_rate,
+                                     sigma=option_sigma,  # Does it make sense to use the calculated IV? For the Theo? Unsure...
+                                     option_type=option_type)
+
+                contract_qty = self.contracts_per_trade if dec == 'buy' else -self.contracts_per_trade
+
+                hedge_qty = -option_delta * 100 * contract_qty
+
+                opt_signal = TradeSignal(
+                                        symbol,
+                                        action=dec,
+                                        quantity=contract_qty,
+                                        market_price=option_mid,
+                                        theo_price=option_theo,
+                                        mispricing_pct=mispricing_pct,
+                                        strike=option_K,
+                                        expiry=option_expiry,
+                                        option_type=option_type,
+                                        delta=option_delta,
+                                        hedge_quantity=hedge_qty,
+                                        timestamp=current_date,
+                                        underlying_price=underlying_price,
+                                        dte=option_T)
+                signals.append(opt_signal)
+
+        # Sort by mispricing magnitude and Return top N signals
+        signals.sort(key=lambda x: abs(x.mispricing_pct), reverse=True)
+
+        return signals[:new_position_count]
     
     def create_trade_from_signal(self, signal: TradeSignal, trade_type: str) -> Trade:
         """
@@ -278,9 +288,7 @@ class MispricingStrategy(BaseStrategy):
                 - 'stock': Create delta hedge trade
                 
         Returns:
-            Trade object ready for portfolio.execute_trade()
-            
-        TODO: IMPLEMENT THIS METHOD
+            Trade object ready for portfolio.execute_trade()\
         
         Structure:
             if trade_type == 'option':
@@ -305,21 +313,48 @@ class MispricingStrategy(BaseStrategy):
               * Long call (+delta) → Short stock (negative quantity)
               * Short call (-delta) → Long stock (positive quantity)
             - Use signal.timestamp for trade timestamp
-            
-        Interview Question: "Why delta hedge immediately?"
-            We want to isolate our vol bet from directional exposure.
-            If we buy a call thinking it's underpriced due to low implied vol,
-            we don't want to also bet on the stock going up. Delta hedging
-            neutralizes the directional exposure so PnL comes purely from
-            vol forecast accuracy. This is a market-neutral strategy.
+
         """
-        # TODO: YOUR CODE HERE
-        raise NotImplementedError("TODO: Implement create_trade_from_signal()")
+        if trade_type == 'option':
+            # Create option trade
+            trade = Trade(
+                symbol=signal.symbol,
+                quantity=signal.quantity,
+                price=signal.market_price,
+                trade_type='option',
+                timestamp=signal.timestamp,
+                strike=signal.strike,
+                expiry=signal.expiry,
+                option_type=signal.option_type
+            )
+            
+        elif trade_type == 'stock':
+            # Create delta hedge trade
+            trade = Trade(
+                symbol=signal.symbol,
+                quantity=signal.hedge_quantity,
+                price=signal.underlying_price,
+                trade_type='stock',
+                timestamp=signal.timestamp,
+                strike=None,
+                expiry=None,
+                option_type=None
+            )
+        else:
+            raise ValueError(f"Unknown trade_type: {trade_type}")
+        
+        return trade
 
 
 # ============================================================================
 # HELPER FUNCTIONS FOR STRATEGY ANALYSIS
 # ============================================================================
+
+def create_option_key(symbol: str, strike: float, expiry: datetime, option_type: str) -> str:
+    """Create unique identifier for an option."""
+    return f"{symbol}_{strike:.0f}{option_type[0].upper()}_{expiry.strftime('%Y%m%d')}"
+
+
 
 def count_option_positions(portfolio) -> int:
     """

@@ -48,12 +48,12 @@ CONFIG = {
     
     # Backtest parameters
     'start_date': datetime(2019, 1, 1),
-    'end_date': datetime(2019, 12, 31),
+    'end_date': datetime(2019, 12, 24),
     'initial_capital': 100000.0,
     
     # Strategy parameters
     'mispricing_threshold': 0.10,  # 10% mispricing required
-    'max_positions': 5,
+    'max_positions': 100,
     'contracts_per_trade': 1,
     
     # Model parameters
@@ -81,8 +81,6 @@ def setup_historical_model(prices: pd.Series, window: int = 30) -> callable:
         
     Returns:
         Callable that returns current historical vol
-        
-    TODO: IMPLEMENT THIS
     
     Hints:
         - Calculate rolling returns
@@ -90,9 +88,9 @@ def setup_historical_model(prices: pd.Series, window: int = 30) -> callable:
         - Return a simple float (latest vol) or a callable
         - Could also return a lambda: lambda S, K, T: latest_vol
     """
-    # TODO: YOUR CODE HERE
-    raise NotImplementedError("TODO: Implement historical model setup")
-
+    realized_vol = calculate_realized_volatility(prices=prices, window=window, annualize=True)
+    
+    return realized_vol.iloc[-1]
 
 def setup_surface_model(options_df: pd.DataFrame) -> VolatilitySurface:
     """
@@ -112,8 +110,11 @@ def setup_surface_model(options_df: pd.DataFrame) -> VolatilitySurface:
         - Return fitted surface
         - See src/volatility/surface.py for interface
     """
-    # TODO: YOUR CODE HERE
-    raise NotImplementedError("TODO: Implement surface model setup")
+    vol_surface = VolatilitySurface('polynomial')
+    vol_surface.fit(options_df)
+
+    return vol_surface
+
 
 
 def setup_garch_model(returns: pd.Series, horizon: int = 7) -> GARCHForecaster:
@@ -179,9 +180,7 @@ def run_single_backtest(model_name: str,
         
     Returns:
         Tuple of (results_df, engine)
-        
-    TODO: IMPLEMENT THIS
-    
+
     Steps:
         1. Create BacktestEngine instance
         2. Load data (options, prices, rates)
@@ -202,12 +201,33 @@ def run_single_backtest(model_name: str,
     
     # TODO: YOUR CODE HERE
     # 1. Create engine
+    engine = BacktestEngine(
+        start_date=CONFIG['start_date'],
+        end_date=CONFIG['end_date'],
+        initial_capital=CONFIG['initial_capital']
+    )
     # 2. Load data
+    engine.load_data(
+        options_path=CONFIG['options_path'],
+        prices_path=CONFIG['prices_path'],
+        rates_path=CONFIG['rates_path']
+    )
+
     # 3. Setup strategy
+    strategy = MispricingStrategy(
+        vol_model=vol_model,
+        returns_data=returns_data,
+        threshold=CONFIG['mispricing_threshold'],
+        max_positions=CONFIG['max_positions'],
+        contracts_per_trade=CONFIG['contracts_per_trade']
+    )
+    engine.set_strategy(strategy)
+
     # 4. Run backtest
-    # 5. Return results
+    results = engine.run()
+    print(f"  Complete! Final equity: ${results.iloc[-1]['equity']:,.2f}")
     
-    raise NotImplementedError("TODO: Implement run_single_backtest()")
+    return results, engine
 
 
 def run_all_backtests() -> Dict[str, pd.DataFrame]:
@@ -216,9 +236,7 @@ def run_all_backtests() -> Dict[str, pd.DataFrame]:
     
     Returns:
         Dictionary mapping model_name -> results_df
-        
-    TODO: IMPLEMENT THIS
-    
+ 
     Steps:
         1. Load price data and calculate returns
         2. Setup each of the 4 models
@@ -237,8 +255,24 @@ def run_all_backtests() -> Dict[str, pd.DataFrame]:
         
         return results
     """
-    # TODO: YOUR CODE HERE
-    raise NotImplementedError("TODO: Implement run_all_backtests()")
+    # Load data
+    prices = pd.read_parquet(CONFIG['prices_path'])
+    options = pd.read_parquet(CONFIG['options_path'])
+    
+    # Calculate returns and initialize results_dict
+    returns = np.log(prices['close'] / prices['close'].shift(1)).dropna()
+    results = {}
+
+    # # # Run backtest for each modeling approach
+    # Historical (pass Series, not DataFrame)
+    hist_model = setup_historical_model(prices['close'], window=30)
+    results['historical'] = run_single_backtest('historical', hist_model, returns)
+
+    # Volatility surface
+    vol_surface = setup_surface_model(options)
+    results['vol_surface'] = run_single_backtest('vol_surface', vol_surface)
+
+    return results
 
 
 # ============================================================================
@@ -257,25 +291,46 @@ def calculate_performance_metrics(equity_curve: pd.Series,
     Returns:
         Dictionary with performance metrics
         
-    TODO: IMPLEMENT THIS
-    
-    Metrics to Calculate:
-        - total_return: (final - initial) / initial
-        - annualized_return: Assuming 252 trading days
-        - sharpe_ratio: (mean_daily_return / std_daily_return) * sqrt(252)
-        - max_drawdown: Maximum peak-to-trough decline
-        - win_rate: % of positive return days
-        - volatility: Annualized volatility of returns
-        - calmar_ratio: annualized_return / abs(max_drawdown)
-        
-    Hints:
-        - Calculate daily returns: equity_curve.pct_change()
-        - Max drawdown: (trough - peak) / peak for worst drawdown
-        - Handle NaN values from pct_change()
-        - Annualize using sqrt(252) for vol, 252x for returns
     """
-    # TODO: YOUR CODE HERE
-    raise NotImplementedError("TODO: Implement calculate_performance_metrics()")
+    # Calculate returns
+    returns = equity_curve.pct_change().dropna()
+    
+    # Total return
+    total_return = (equity_curve.iloc[-1] - initial_capital) / initial_capital
+    
+    # Annualized return (assuming 252 trading days)
+    num_days = len(equity_curve)
+    years = num_days / 252
+    annualized_return = (1 + total_return) ** (1 / years) - 1
+    
+    # Sharpe ratio
+    mean_daily_return = returns.mean()
+    std_daily_return = returns.std()
+    sharpe_ratio = (mean_daily_return / std_daily_return) * np.sqrt(252)
+    
+    # Max drawdown
+    running_max = equity_curve.expanding().max()
+    drawdown = (equity_curve - running_max) / running_max
+    max_drawdown = drawdown.min()
+    
+    # Win rate
+    win_rate = (returns > 0).sum() / len(returns)
+    
+    # Volatility
+    volatility = std_daily_return * np.sqrt(252)
+    
+    # Calmar ratio
+    calmar_ratio = annualized_return / abs(max_drawdown) if max_drawdown != 0 else 0
+    
+    return {
+        'Total Return (%)': total_return * 100,
+        'Annualized Return (%)': annualized_return * 100,
+        'Sharpe Ratio': sharpe_ratio,
+        'Max Drawdown (%)': max_drawdown * 100,
+        'Win Rate (%)': win_rate * 100,
+        'Volatility (%)': volatility * 100,
+        'Calmar Ratio': calmar_ratio
+    }
 
 
 def create_metrics_comparison_table(all_results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -287,27 +342,25 @@ def create_metrics_comparison_table(all_results: Dict[str, pd.DataFrame]) -> pd.
         
     Returns:
         DataFrame with models as rows, metrics as columns
-        
-    TODO: IMPLEMENT THIS
-    
-    Steps:
-        1. For each model, extract equity curve from results
-        2. Calculate metrics using calculate_performance_metrics()
-        3. Build DataFrame with results
-        4. Sort by Sharpe ratio (or another metric)
-        5. Return comparison table
-        
-    Expected output columns:
-        - Total Return (%)
-        - Annualized Return (%)
-        - Sharpe Ratio
-        - Max Drawdown (%)
-        - Win Rate (%)
-        - Volatility (%)
-        - Calmar Ratio
+
     """
-    # TODO: YOUR CODE HERE
-    raise NotImplementedError("TODO: Implement create_metrics_comparison_table()")
+    metrics_list = []
+
+    for model_name, results_df in all_results.items():
+        print(results_df)
+        equity = results_df['equity']
+        metrics = calculate_performance_metrics(equity)
+        metrics['Model'] = model_name
+        metrics_list.append(metrics)
+    
+    # Create DataFrame
+    df = pd.DataFrame(metrics_list)
+    df = df.set_index('Model')
+    
+    # Sort by Sharpe ratio
+    df = df.sort_values('Sharpe Ratio', ascending=False)
+    
+    return df
 
 
 # ============================================================================
@@ -322,27 +375,28 @@ def plot_equity_curves(all_results: Dict[str, pd.DataFrame],
     Args:
         all_results: Dict mapping model_name -> results_df
         save_path: Path to save figure (optional)
-        
-    TODO: IMPLEMENT THIS
-    
-    Requirements:
-        - One line per model
-        - Normalize to start at 100 (or initial capital)
-        - Include legend
-        - Add title, axis labels
-        - Use professional color scheme
-        - Add horizontal line at initial capital
-        - Optionally save to file
-        
-    Hints:
-        - Use plt.figure(figsize=(12, 6))
-        - Extract equity column from each results_df
-        - plt.plot(dates, equity, label=model_name)
-        - plt.legend()
-        - plt.grid(alpha=0.3)
+
     """
-    # TODO: YOUR CODE HERE
-    pass
+    plt.figure(figsize=(12, 6))
+    
+    for model_name, results_df in all_results.items():
+        plt.plot(results_df['date'], results_df['equity'], 
+                label=model_name, linewidth=2)
+    
+    plt.axhline(y=100000, color='gray', linestyle='--', 
+                alpha=0.5, label='Initial Capital')
+    
+    plt.title('Equity Curves: All Models', fontsize=14, fontweight='bold')
+    plt.xlabel('Date')
+    plt.ylabel('Portfolio Equity ($)')
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    
+    plt.show()
 
 
 def plot_drawdown_comparison(all_results: Dict[str, pd.DataFrame], 
@@ -481,12 +535,24 @@ def main():
     for key, value in CONFIG.items():
         print(f"  {key}: {value}")
     
-    # TODO: YOUR CODE HERE
-    # 1. Run backtests
-    # 2. Calculate metrics
-    # 3. Generate plots
-    # 4. Save results
-    # 5. Print summary
+    # Run backtests
+    print("\nStep 1: Running backtests...")
+    all_results = run_all_backtests()
+    
+    # Calculate metrics
+    print("\nStep 2: Calculating metrics...")
+    metrics_df = create_metrics_comparison_table(all_results)
+    print("\n" + "="*60)
+    print("PERFORMANCE COMPARISON")
+    print("="*60)
+    print(metrics_df.round(2))
+    
+    # Generate plots
+    print("\nStep 3: Generating visualizations...")
+    plot_equity_curves(all_results, 
+                      save_path=f"{CONFIG['results_dir']}/equity_curves.png")
+    
+
     
     print("\n" + "="*80)
     print("PHASE 5 COMPLETE!")

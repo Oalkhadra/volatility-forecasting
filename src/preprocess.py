@@ -10,13 +10,13 @@ from pathlib import Path
 from typing import Optional, List
 from io import StringIO
 import yfinance as yf
-from .pricing.risk_free_rate import get_risk_free_rate
+from pricing.risk_free_rate import get_risk_free_rate
 
 # Constants
 DOLT_REPO_PATH = "data/raw/options"
 OUTPUT_DIR = "data/processed"
 START = '2019-06-03'
-END = '2020-01-01'
+END = '2020-12-31'
 
 def run_dolt_query(query: str, repo_path: str = DOLT_REPO_PATH) -> pd.DataFrame:
     """

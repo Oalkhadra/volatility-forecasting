@@ -101,7 +101,6 @@ class VolatilitySurface:
         strike: float,
         underlying_price: float,
         days_to_expiry: float,
-        option_type: str = 'call'
     ) -> float:
         """
         Get fitted volatility for a specific option.
@@ -110,7 +109,6 @@ class VolatilitySurface:
             strike: Strike price
             underlying_price: Spot price
             days_to_expiry: Days to expiration
-            option_type: 'call' or 'put' (may adjust for skew)
             
         Returns:
             Fitted implied volatility

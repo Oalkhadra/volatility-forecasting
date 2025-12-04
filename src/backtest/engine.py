@@ -238,7 +238,8 @@ class Portfolio:
                 
                 try:
                     # Calculate implied volatility at current moment
-                    sigma = implied_volatility(option_price = pos.current_price,
+                    sigma = implied_volatility(
+                                            option_price = pos.current_price,
                                             S = S,
                                             K=pos.strike,
                                             T=T,
@@ -287,8 +288,8 @@ class BacktestEngine:
         
     def load_data(self, options_path: str, prices_path: str, rates_path: str):
         """
-        Load market data.
-
+        Load market data and filter to backtest date range.
+        Note: Keeps historical price data before start_date for rolling calculations.
         """
         # Read data, already sorted and filtered by date when stored through preprocess.py
         options_df = pd.read_parquet(options_path)        
@@ -301,6 +302,13 @@ class BacktestEngine:
         prices_df['date'] = pd.to_datetime(prices_df['date'])
         rfr_df['date'] = pd.to_datetime(rfr_df['date'])
 
+        # Format option_type string
+        options_df['call_put'] = options_df['call_put'].str.lower()
+
+        # Filter data to backtest date range
+        options_df = options_df[options_df['date'] <= self.end_date]
+        prices_df = prices_df[prices_df['date'] <= self.end_date]
+        rfr_df = rfr_df[rfr_df['date'] <= self.end_date]
 
         self.options_data = options_df
         self.prices_data = prices_df
@@ -360,15 +368,32 @@ class BacktestEngine:
             raise ValueError(f"No price data found for {current_date}: Price = {price}")
 
     def get_daily_dates(self, current_date: datetime):
+        """Get actual trading days from price data for the week following current_date."""
         monday = current_date + timedelta(days=2)
+        friday = monday + timedelta(days=4)
         
-        # Generate Monday through Friday
-        daily_dates = [monday + timedelta(days=i) for i in range(5)]
-        
-        return daily_dates
+        # Filter actual trading days from price data
+        trading_days = self.prices_data[
+            (self.prices_data['date'] >= monday) & 
+            (self.prices_data['date'] <= friday)
+        ]['date'].tolist()
+    
+        return trading_days
 
     def get_interest_rate(self, current_date: datetime):
-        return self.rates_data.loc[self.rates_data['date'] == current_date, 'risk_free_rate'].iloc[0]
+        """Get risk-free rate for given date, using most recent rate if exact date not available."""
+        rate_match = self.rates_data.loc[self.rates_data['date'] == current_date, 'risk_free_rate']
+        
+        if len(rate_match) > 0:
+            return rate_match.iloc[0]
+        else:
+            # If exact date not found, use most recent rate before this date
+            prior_rates = self.rates_data[self.rates_data['date'] < current_date]
+            if len(prior_rates) > 0:
+                return prior_rates.iloc[-1]['risk_free_rate']
+            else:
+                # Fallback: use first available rate
+                return self.rates_data.iloc[0]['risk_free_rate']
 
     def run(self):
         """
@@ -393,8 +418,9 @@ class BacktestEngine:
         """
         print("Starting backtest...")
         
-        trading_weeks = self.get_unique_saturdays()[9:] # Start with week 10 (For historical data purposes)
-
+        # Start at week 10 to provide buffer for rolling calculations (e.g., 30-day historical volatility)
+        trading_weeks = self.get_unique_saturdays()[9:-1]
+        print(trading_weeks)
         # Iterate through weeks in data, 
         for saturday in trading_weeks:
             # Get underlying close price (on Friday)
@@ -410,8 +436,6 @@ class BacktestEngine:
                     'equity': self.portfolio.cash + sum(p.market_value() for p in self.portfolio.positions.values()),
                     'cash': self.portfolio.cash
                 })
-
-
 
             # Store current available options snapshot
             options_snapshot = self.options_data[self.options_data['date'] == saturday]
@@ -433,6 +457,8 @@ class BacktestEngine:
             daily_dates = self.get_daily_dates(saturday)
 
             for day in daily_dates:
+                if day > self.end_date:
+                    break
                 underlying_price = self.get_underlying_price(day, weekly=False)
                 current_rate = self.get_interest_rate(day)
                 # Create prices_dict with only stock price (options keep Saturday price)

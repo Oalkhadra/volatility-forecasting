@@ -12,13 +12,12 @@ actually happens. Historical realized vol provides the "true" volatility.
 
 import numpy as np
 import pandas as pd
-from typing import Optional, Literal
+from typing import Optional
 
 
 def calculate_realized_volatility(
     prices: pd.Series,
     window: int = 30,
-    method: Literal['close', 'parkinson', 'garman_klass'] = 'close',
     annualize: bool = True
 ) -> pd.Series:
     """
@@ -27,10 +26,6 @@ def calculate_realized_volatility(
     Args:
         prices: pandas Series of prices (typically 'close' prices)
         window: Rolling window size in days (default 30)
-        method: Calculation method:
-            - 'close': Standard close-to-close volatility
-            - 'parkinson': Uses high-low range (more efficient)
-            - 'garman_klass': Uses OHLC (most efficient)
         annualize: If True, multiply by sqrt(252) to annualize
     
     Returns:

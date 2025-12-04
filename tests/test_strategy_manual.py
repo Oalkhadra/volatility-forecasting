@@ -30,7 +30,7 @@ def test_calculate_theo_price():
     strategy = MispricingStrategy(vol_model=0.20, threshold=0.10)
     
     try:
-        theo_price = strategy.calculate_theo_price(
+        theo_price, theo_sigma = strategy.calculate_theo_price(
             S=300,
             K=300,
             T=7/365,
@@ -64,10 +64,13 @@ def test_generate_signals():
     
     # Create mock options snapshot
     snapshot = pd.DataFrame({
+        'act_symbol': ['SPY','SPY','SPY','SPY','SPY'],
         'strike': [295.0, 300.0, 305.0, 300.0, 305.0],
         'expiration': [pd.Timestamp('2019-06-21')] * 5,
         'call_put': ['call', 'call', 'call', 'put', 'put'],
+        'bid': [7.0, 4.0, 2.0, 3.5, 5.5],
         'mid_price': [8.0, 5.0, 3.0, 4.5, 6.5],  # Some overpriced, some underpriced
+        'ask': [9.0, 6.0, 4.0, 5.5, 7.5],
         'underlying_price': [300.0] * 5,
         'days_to_expiry': [7] * 5
     })
@@ -175,7 +178,7 @@ def test_mini_backtest():
         # Create engine
         engine = BacktestEngine(
             start_date=datetime(2019, 6, 1),
-            end_date=datetime(2019, 6, 30),
+            end_date=datetime(2019, 9, 30),
             initial_capital=100000
         )
         

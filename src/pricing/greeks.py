@@ -13,7 +13,7 @@ Also includes implied volatility solver.
 
 import numpy as np
 from scipy.stats import norm
-from scipy.optimize import newton
+from scipy.optimize import newton, brentq
 from typing import Literal
 from .pricer import black_scholes_price, moneyness, intrinsic_value
 
@@ -361,17 +361,21 @@ def implied_volatility(
     r: float,
     option_type: Literal['call', 'put'],
     initial_guess: float = 0.25,
-    max_iterations: int = 10,
+    max_iterations: int = 100,
     tolerance: float = 1e-6
 ) -> float:
     """
-    Calculate implied volatility using Newton-Raphson method.
+    Calculate implied volatility using Newton-Raphson method with fallback.
     
     Implied volatility (IV) is the "market's opinion" of future volatility.
     It's the σ value that makes Black-Scholes price match the observed 
     market price.
     
     This is an inverse problem: we know the price, solve for σ.
+    
+    Strategy:
+        1. Try Newton-Raphson first (fast, uses gradient)
+        2. If it fails (deep OTM near expiry), fallback to Brent's method (bounded bisection)
     
     Newton-Raphson Formula:
         σ_new = σ_old - f(σ) / f'(σ)
@@ -388,7 +392,7 @@ def implied_volatility(
         r: Risk-free rate (annual)
         option_type: 'call' or 'put'
         initial_guess: Starting volatility guess (default 25%)
-        max_iterations: Maximum Newton-Raphson iterations
+        max_iterations: Maximum iterations
         tolerance: Convergence tolerance
     
     Returns:
@@ -401,11 +405,15 @@ def implied_volatility(
         >>> # If market price is $10, what vol is implied?
         >>> implied_volatility(10.0, 100, 100, 1.0, 0.05, 'call')
         0.1987...  # ~19.87% implied vol
+        
+        >>> # Deep OTM near expiry (falls back to Brent's method)
+        >>> implied_volatility(0.34, 321.08, 263.0, 0.0027, 0.02, 'put')
+        4.87...  # Very high IV for deep OTM
     
     Edge Cases:
         - Price below intrinsic value: Raise ValueError (arbitrage)
-        - Very deep ITM/OTM: Vega → 0, Newton-Raphson fails
-        - At expiration: IV is meaningless
+        - Very deep OTM near expiry: Vega → 0, uses Brent's method fallback
+        - At expiration: IV is meaningless, raises error
     
     Interview Question: "Why solve for IV instead of using historical vol?"
         Historical vol tells you what WAS. Implied vol tells you what 
@@ -434,11 +442,18 @@ def implied_volatility(
     if abs(option_price - intrinsic) < 0.01:
         return 0.01  # Minimum vol (essentially zero time value)
     
+    # For deep OTM options near expiry, use a higher initial guess
+    # (These cases often have very high implied vol)
+    if T < 0.05:  # Less than ~18 days to expiry
+        if option_type == 'call' and S / K < 0.90:  # Deep OTM call
+            initial_guess = min(1.0, initial_guess * 3)
+        elif option_type == 'put' and S / K > 1.10:  # Deep OTM put
+            initial_guess = min(1.0, initial_guess * 3)
+    
     # Define the objective function: f(σ) = BS_price(σ) - market_price
     def objective(sigma):
         """Function to find root of (should equal zero at solution)."""
-        if sigma <= 0:
-            return 1e10  # Return large value for invalid sigma
+        sigma = np.clip(sigma, 0.0001, 5.0)  # ← Prevent invalid values
 
         return black_scholes_price(S, K, T, r, sigma, option_type) - option_price
 
@@ -446,8 +461,7 @@ def implied_volatility(
     # Define the derivative: f'(σ) = vega(σ) 
     def derivative(sigma):
         """Derivative of objective function (vega)."""
-        if sigma <= 0:
-            return 1e-10 # Return large value for invalid sigma
+        sigma = np.clip(sigma, 0.0001, 5.0)  # ← Prevent invalid values
 
         # Get vega (per 1% vol change)
         option_vega = vega(S, K, T, r, sigma, option_type)
@@ -463,7 +477,7 @@ def implied_volatility(
 
     
     try:
-        # Use scipy's Newton-Raphson solver
+        # Try Newton-Raphson first (fast when it works)
         solved_iv = newton(
             func=objective,
             x0=initial_guess,
@@ -487,13 +501,38 @@ def implied_volatility(
         
         return solved_iv
         
-    except RuntimeError as e:
-        # Newton-Raphson failed to converge
-        raise ValueError(
-            f"IV solver failed to converge after {max_iterations} iterations. "
-            f"Option characteristics: S=${S:.2f}, K=${K:.2f}, T={T:.4f}, "
-            f"Price=${option_price:.2f}, Intrinsic=${intrinsic:.2f}"
-        ) from e
+    except RuntimeError:
+        # Newton-Raphson failed - fallback to bounded bisection method
+        # This is more robust for deep OTM options near expiry (low vega)
+        try:
+            # Use Brent's method with bounds [0.001, 5.0]
+            solved_iv = brentq(
+                f=objective,
+                a=0.001,  # Lower bound on volatility
+                b=5.0,    # Upper bound on volatility
+                xtol=tolerance,
+                maxiter=max_iterations
+            )
+            
+            # Verify solution
+            verification_price = black_scholes_price(S, K, T, r, solved_iv, option_type)
+            if abs(verification_price - option_price) > 0.10:
+                raise ValueError(
+                    f"IV solution verification failed (Brent's method). "
+                    f"Solved IV={solved_iv:.4f} gives price ${verification_price:.2f}, "
+                    f"but market price is ${option_price:.2f}"
+                )
+            
+            return solved_iv
+            
+        except ValueError as e:
+            # Even bounded method failed - likely arbitrage violation or extreme case
+            raise ValueError(
+                f"IV solver failed (both Newton-Raphson and Brent's method). "
+                f"Option characteristics: S=${S:.2f}, K=${K:.2f}, T={T:.4f}, "
+                f"Price=${option_price:.2f}, Intrinsic=${intrinsic:.2f}, Type={option_type}. "
+                f"This may indicate an arbitrage violation or extreme market conditions."
+            ) from e
 
 
 def calculate_all_greeks(
