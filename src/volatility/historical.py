@@ -14,6 +14,8 @@ import numpy as np
 import pandas as pd
 from typing import Optional
 
+from pandas.io.stata import datetime
+
 
 def calculate_realized_volatility(
     prices: pd.Series,
@@ -65,7 +67,7 @@ class RollingVolCalculator:
     Useful for backtesting - maintains state as new data arrives.
     """
     
-    def __init__(self, window: int = 30, annualize: bool = True):
+    def __init__(self, prices_data: pd.DataFrame = None, window: int = 30, annualize: bool = True):
         """
         Initialize rolling vol calculator.
         
@@ -75,66 +77,33 @@ class RollingVolCalculator:
         """
         self.window = window
         self.annualize = annualize
-        self.returns = []  # Store recent returns
-        
-    def update(self, new_price: float, prev_price: float) -> float:
-        """
-        Update calculator with new price and return current volatility estimate.
-        
-        Args:
-            new_price: Current price
-            prev_price: Previous price
-            
-        Returns:
-            Current volatility estimate
-            
-        TODO: Implement incremental volatility update
-        
-        Hints:
-            1. Calculate log return: ln(new_price / prev_price)
-            2. Append to self.returns list
-            3. Keep only last 'window' returns
-            4. Calculate std of returns
-            5. Annualize if needed: std * sqrt(252)
-        """
-        lret = np.log(new_price / prev_price)
+        self.prices = prices_data
 
-        self.returns.append(lret)
-
-        if len(self.returns) > self.window:
-            self.returns.pop(0)
-        
-        # Convert list to numpy array for std calculation
-        # Using ddof=1 for sample standard deviation (matching pandas default)
-        stdev = np.std(self.returns, ddof=1)
-
-        if self.annualize:
-            return stdev * np.sqrt(252)
-        
-        return stdev
-
-
-    
-    def get_current_vol(self) -> Optional[float]:
+    def get_current_vol(self, current_date: datetime) -> Optional[float]:
         """
         Get current volatility estimate.
         
         Returns:
             Current vol, or None if insufficient data
         """
-        if len(self.returns) < self.window:
+
+        if self.prices['date'].dtype == 'object':
+                self.prices['date'] = pd.to_datetime(self.prices['date'])
+  
+        prices_current = self.prices[self.prices['date'] < current_date]
+
+        if len(prices_current) < self.window:
             return None
-            
-        stdev = np.std(self.returns, ddof=1)
+        
+        return_window = prices_current.tail(self.window)
+        returns = np.log(return_window['close'] / return_window['close'].shift(1)).dropna()
+
+        stdev = np.std(returns, ddof=1)
 
         if self.annualize:
             return stdev * np.sqrt(252)
         
         return stdev
-    
-    def reset(self):
-        """Reset the calculator state."""
-        self.returns = []
 
 
 if __name__ == "__main__":

@@ -367,23 +367,6 @@ def implied_volatility(
     """
     Calculate implied volatility using Newton-Raphson method with fallback.
     
-    Implied volatility (IV) is the "market's opinion" of future volatility.
-    It's the σ value that makes Black-Scholes price match the observed 
-    market price.
-    
-    This is an inverse problem: we know the price, solve for σ.
-    
-    Strategy:
-        1. Try Newton-Raphson first (fast, uses gradient)
-        2. If it fails (deep OTM near expiry), fallback to Brent's method (bounded bisection)
-    
-    Newton-Raphson Formula:
-        σ_new = σ_old - f(σ) / f'(σ)
-    
-    Where:
-        f(σ) = BS_price(σ) - market_price
-        f'(σ) = vega(σ)
-    
     Args:
         option_price: Observed market price
         S: Current stock price
@@ -400,30 +383,7 @@ def implied_volatility(
      
     Raises:
         ValueError: If IV cannot be found (price violates arbitrage bounds)
-    
-    Examples:
-        >>> # If market price is $10, what vol is implied?
-        >>> implied_volatility(10.0, 100, 100, 1.0, 0.05, 'call')
-        0.1987...  # ~19.87% implied vol
-        
-        >>> # Deep OTM near expiry (falls back to Brent's method)
-        >>> implied_volatility(0.34, 321.08, 263.0, 0.0027, 0.02, 'put')
-        4.87...  # Very high IV for deep OTM
-    
-    Edge Cases:
-        - Price below intrinsic value: Raise ValueError (arbitrage)
-        - Very deep OTM near expiry: Vega → 0, uses Brent's method fallback
-        - At expiration: IV is meaningless, raises error
-    
-    Interview Question: "Why solve for IV instead of using historical vol?"
-        Historical vol tells you what WAS. Implied vol tells you what 
-        the MARKET THINKS will happen. IV is forward-looking and 
-        incorporates all market participants' views.
-    
-    Advanced: "What's the volatility smile?"
-        In reality, IV varies by strike (smile/smirk). This violates 
-        Black-Scholes assumptions. Far OTM puts have higher IV due to 
-        crash risk. This is called "volatility skew."
+
     """
     
     # Validation: Check for arbitrage violations
@@ -432,6 +392,9 @@ def implied_volatility(
         raise ValueError(
             f"Option price ${option_price:.2f} below intrinsic value ${intrinsic:.2f}. "
             f"This violates no-arbitrage"
+            f"Option characteristics: S=${S:.2f}, K=${K:.2f}, T={T:.4f}, "
+            f"Price=${option_price:.2f}, Intrinsic=${intrinsic:.2f}, Type={option_type}. "
+            f"This may indicate an arbitrage violation or extreme market conditions."
         )
     
     # Edge case: at or past expiration

@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 import sys
 import os
+from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ..pricing.greeks import calculate_all_greeks, implied_volatility
@@ -37,6 +38,7 @@ class Position:
     strike: Optional[float] = None
     expiry: Optional[datetime] = None
     option_type: Optional[str] = None
+    implied_vol: Optional[float] = None # Addition to store implied vol for daily rebalancing, since I can't calculate daily vol without daily option data!!!
     
     def market_value(self) -> float:
         """Calculate current market value."""
@@ -71,6 +73,7 @@ class Trade:
     strike: Optional[float] = None
     expiry: Optional[datetime] = None
     option_type: Optional[str] = None
+    implied_vol: Optional[float] = None  # Store IV for daily rebalancing
     
     def get_key(self) -> str:
         """Get unique position key for this trade."""
@@ -87,6 +90,8 @@ class Portfolio:
         self.positions: Dict[str, Position] = {}
         self.history: List[dict] = []
         self.trade_log: List[Trade] = []
+        self.expiry_log: List[dict] = []  # Separate log for expiry events
+        self.iv_log: List[dict] = []  # Daily IV predictions from the strategy
         
     def execute_trade(self, trade: Trade, apply_costs: bool = True):
         """
@@ -150,7 +155,8 @@ class Portfolio:
                 position_type=trade.trade_type,
                 strike=trade.strike,
                 expiry=trade.expiry,
-                option_type=trade.option_type
+                option_type=trade.option_type,
+                implied_vol=trade.implied_vol
             )
             self.positions[pos_key] = new_pos
         
@@ -216,7 +222,34 @@ class Portfolio:
         for key in expired_keys:
             del self.positions[key]
         
+        # Log expiry event separately if there was activity
+        if total_pnl != 0:
+            self.expiry_log.append({
+                'date': current_date,
+                'event': 'expiry',
+                'pnl': total_pnl,
+                'num_expired': len(expired_keys)
+            })
+        
         return total_pnl
+    
+    def log_iv_prediction(self, date: datetime, implied_vol: float, underlying_price: float, 
+                          day_type: str = 'option_trading'):
+        """
+        Log the implied volatility prediction used by the strategy.
+        
+        Args:
+            date: Current date
+            implied_vol: IV prediction from the volatility model
+            underlying_price: Current underlying price
+            day_type: 'option_trading' or 'rebalancing'
+        """
+        self.iv_log.append({
+            'date': date,
+            'implied_vol': implied_vol,
+            'underlying_price': underlying_price,
+            'day_type': day_type
+        })
     
     def get_portfolio_delta(self, S: float, r: float, current_date: datetime) -> float:
         """
@@ -236,19 +269,25 @@ class Portfolio:
                 # Calculate time to expiry in years
                 T = max(0, relativedelta(pos.expiry, current_date).days / 365.0)
                 
-                try:
-                    # Calculate implied volatility at current moment
-                    sigma = implied_volatility(
-                                            option_price = pos.current_price,
-                                            S = S,
-                                            K=pos.strike,
-                                            T=T,
-                                            r=r,
-                                            option_type=pos.option_type)
-                except Exception as e:
-                    print(f"IV Calculation caused an error: {e}")
-                    print("Defaulting to 0.2 Vol")
-                    sigma = 0.2
+
+                # Use stored IV instead of recalculating
+                if pos.implied_vol:
+                    sigma = pos.implied_vol  
+                    
+                else:
+                    try:
+                        # Calculate implied volatility at current moment
+                        sigma = implied_volatility(
+                                                option_price = pos.current_price,
+                                                S = S,
+                                                K=pos.strike,
+                                                T=T,
+                                                r=r,
+                                                option_type=pos.option_type)
+                    except Exception as e:
+                        print(f"IV Calculation caused an error: {e}")
+                        print("Defaulting to 0.2 Vol")
+                        sigma = 0.2
 
 
                 # Get option delta
@@ -350,33 +389,56 @@ class BacktestEngine:
             trade = Trade(symbol, rebalance_qty, current_price, t_type, current_date)
             self.portfolio.execute_trade(trade, True)
 
-    def get_unique_saturdays(self):
-        return self.options_data['date'].unique()
+    def get_option_trading_days(self):
+        """Get all days where option data is available for trading."""
+        return sorted(self.options_data['date'].unique())
         
     def get_underlying_price(self, current_date: datetime, weekly: bool = True):
         # If weekly is toggled, I am looking for Friday's close price, otherwise, get today's price
         if weekly:
-            # Using options dates, subtract to Friday and return close of the week
-            close_date = current_date - timedelta(days=1)
-            price = self.prices_data.loc[self.prices_data['date'] == close_date, 'close']
+            # Find the most recent trading day before or on current_date
+            # This handles weekends, holidays, and data gaps
+            available_prices = self.prices_data[self.prices_data['date'] <= current_date]
+            if len(available_prices) > 0:
+                return float(available_prices.iloc[-1]['close'])
+            else:
+                raise ValueError(f"No price data found on or before {current_date}")
         else:
+            # For daily prices, look for exact match first, then fall back to most recent
             price = self.prices_data.loc[self.prices_data['date'] == current_date, 'close']
+            if len(price) > 0:
+                return float(price.iloc[0])
+            else:
+                # Fall back to most recent price before this date
+                available_prices = self.prices_data[self.prices_data['date'] < current_date]
+                if len(available_prices) > 0:
+                    return float(available_prices.iloc[-1]['close'])
+                else:
+                    raise ValueError(f"No price data found on or before {current_date}")
 
-        if len(price) > 0:
-            return float(price.iloc[0])
-        else:
-            raise ValueError(f"No price data found for {current_date}: Price = {price}")
-
-    def get_daily_dates(self, current_date: datetime):
-        """Get actual trading days from price data for the week following current_date."""
-        monday = current_date + timedelta(days=2)
-        friday = monday + timedelta(days=4)
+    def get_daily_dates(self, current_date: datetime, next_option_date: datetime = None):
+        """
+        Get actual trading days from price data between current option date and next.
         
-        # Filter actual trading days from price data
-        trading_days = self.prices_data[
-            (self.prices_data['date'] >= monday) & 
-            (self.prices_data['date'] <= friday)
-        ]['date'].tolist()
+        Args:
+            current_date: Current option trading date
+            next_option_date: Next option trading date (or None for until end)
+        
+        Returns:
+            List of trading dates for delta rebalancing
+        """
+        if next_option_date is None:
+            # If no next date, get all remaining trading days
+            trading_days = self.prices_data[
+                (self.prices_data['date'] > current_date) & 
+                (self.prices_data['date'] <= self.end_date)
+            ]['date'].tolist()
+        else:
+            # Get trading days between current and next option date (exclusive of both endpoints)
+            trading_days = self.prices_data[
+                (self.prices_data['date'] > current_date) & 
+                (self.prices_data['date'] < next_option_date)
+            ]['date'].tolist()
     
         return trading_days
 
@@ -394,85 +456,133 @@ class BacktestEngine:
             else:
                 # Fallback: use first available rate
                 return self.rates_data.iloc[0]['risk_free_rate']
+    
+    def _get_atm_iv_forecast(self, underlying_price: float, current_date: datetime, r: float) -> float:
+        """
+        Get IV forecast for ATM option from the strategy's vol model.
+        Uses the strategy's existing calculate_theo_price which handles all model types.
+        """
+        # ATM strike (rounded to nearest strike)
+        K = round(underlying_price / 5) * 5
+        T = 30 / 365  # 30-day forecast horizon
+        
+        # Use strategy's method to get theo price and IV
+        # This handles ALL model types (Historical, Surface, GARCH, ML)
+        _, sigma = self.strategy.calculate_theo_price(
+            S=underlying_price,
+            K=K,
+            T=T,
+            r=r,
+            option_type='call',
+            current_date=current_date
+        )
+        
+        return sigma
 
     def run(self):
         """
-        Run the backtest simulation with weekly trading and daily rebalancing.
+        Run the backtest simulation with option trading on data-available days and daily delta rebalancing.
 
         Structure:
-            OUTER LOOP (Weekly - Saturdays/Sundays):
-                1. Handle expiries from previous week
-                2. Get options snapshot for this week
+            OUTER LOOP (Option Trading Days):
+                1. Handle expiries from previous period
+                2. Get options snapshot for this day
                 3. Generate signals from strategy
                 4. Execute option trades
                 5. Execute initial delta hedges
+                6. Mark to market
                 
-            INNER LOOP (Daily - Mon-Fri):
+            INNER LOOP (Daily Rebalancing):
                 1. Get current underlying price
-                2. Mark to market all positions
-                3. Rebalance delta hedge
-                4. Log daily PnL
+                2. Rebalance delta hedge
+                3. (Market-to-market handled on option trading days)
         
         Returns:
             DataFrame with backtest results
         """
         print("Starting backtest...")
         
-        # Start at week 10 to provide buffer for rolling calculations (e.g., 30-day historical volatility)
-        trading_weeks = self.get_unique_saturdays()[9:-1]
-        print(trading_weeks)
-        # Iterate through weeks in data, 
-        for saturday in trading_weeks:
-            # Get underlying close price (on Friday)
-            underlying_price = self.get_underlying_price(saturday, weekly = True) # Date must be saturday
-            expiry_pnl = self.portfolio.handle_expiries(saturday, underlying_price)
+        # Get all days with option data
+        option_trading_days = self.get_option_trading_days()[5:] # Add 5 trade day buffer for backwards modeling approaches
+        print(f"Option trading days: {len(option_trading_days)}")
+        print(f"First: {option_trading_days[0]}, Last: {option_trading_days[-1]}")
+        
+        # Iterate through option trading days
+        for idx, current_date in enumerate(tqdm(option_trading_days, desc="Backtesting", total=len(option_trading_days))):
+            # Get underlying price for this date
+            underlying_price = self.get_underlying_price(current_date, weekly=False)
+            current_rate = self.get_interest_rate(current_date)
+            
+            # Handle expiries
+            self.portfolio.handle_expiries(current_date, underlying_price)
+            self.rebalance_delta(current_date, underlying_price,current_rate) # Rebalance after expired positions
 
-            # Log expiry PnL
-            if expiry_pnl != 0:
-                self.portfolio.history.append({
-                    'date': saturday,
-                    'event': 'expiry',
-                    'pnl': expiry_pnl,
-                    'equity': self.portfolio.cash + sum(p.market_value() for p in self.portfolio.positions.values()),
-                    'cash': self.portfolio.cash
-                })
-
-            # Store current available options snapshot
-            options_snapshot = self.options_data[self.options_data['date'] == saturday]
-
-            # Generate signals for trading week
+            # Get options snapshot for this trading day
+            options_snapshot = self.options_data[self.options_data['date'] == current_date]
+            
+            # Update vol model with historical data (walk-forward) (Using previous trading days vol!)
+            self.strategy.update_vol_model(current_date)
+            
+            # Generate signals for this trading day
             signals = self.strategy.generate_signals(
-                self.portfolio, options_snapshot, underlying_price, saturday
+                self.portfolio, options_snapshot, underlying_price, current_date
             )
-
-            # Trade on signals
+            
+            # Log IV prediction (use first signal's IV if available, otherwise get ATM forecast)
+            if len(signals) > 0:
+                # Use the IV from the first signal as representative
+                predicted_iv = signals[0].implied_vol
+            else:
+                # No signals generated, but still want to log IV forecast
+                # Get ATM implied vol forecast from strategy
+                predicted_iv = self._get_atm_iv_forecast(underlying_price, current_date, current_rate)
+            
+            self.portfolio.log_iv_prediction(
+                date=current_date,
+                implied_vol=predicted_iv,
+                underlying_price=underlying_price,
+                day_type='option_trading'
+            )
+            
+            # Execute option and hedge trades
             for signal in signals:
                 option_trade = self.strategy.create_trade_from_signal(signal, 'option')
                 self.portfolio.execute_trade(option_trade)
-
+                
                 hedge_trade = self.strategy.create_trade_from_signal(signal, 'stock')
                 self.portfolio.execute_trade(hedge_trade)
-
-            # Once option trade is complete, rebalance hedges for the following week prior to next saturday
-            daily_dates = self.get_daily_dates(saturday)
-
-            for day in daily_dates:
+            
+            # Mark to market after option trades
+            prices_dict = {'SPY': underlying_price}
+            self.portfolio.mark_to_market(prices_dict, current_date)
+            
+            # Get next option date for delta rebalancing window
+            next_option_date = option_trading_days[idx + 1] if idx + 1 < len(option_trading_days) else None
+            
+            # Daily delta rebalancing until next option trading day
+            rebalancing_dates = self.get_daily_dates(current_date, next_option_date)
+            
+            for day in rebalancing_dates:
                 if day > self.end_date:
                     break
+                    
                 underlying_price = self.get_underlying_price(day, weekly=False)
                 current_rate = self.get_interest_rate(day)
-                # Create prices_dict with only stock price (options keep Saturday price)
-                prices_dict = {
-                    'SPY': underlying_price  # Update stock price only
-                }
-                # Option prices stay at their last known value (from Saturday)
-                # No need to update them since we don't have intraweek option data
                 
-                self.portfolio.mark_to_market(prices_dict, day)
+                # Rebalance delta (option prices stay at last known values)
                 self.rebalance_delta(day, underlying_price, r=current_rate)
-
+                
+                # Mark to market with updated stock price
+                prices_dict = {'SPY': underlying_price}
+                self.portfolio.mark_to_market(prices_dict, day)
+        
         print("Backtest complete.")
         return pd.DataFrame(self.portfolio.history)
+
+
+
+
+
 
 
 if __name__ == "__main__":
@@ -640,24 +750,29 @@ if __name__ == "__main__":
         print("\n[TEST 6] BacktestEngine - Helper Functions")
         print("-" * 40)
         
-        # Test get_unique_saturdays
-        saturdays = engine.get_unique_saturdays()
-        print(f"✓ Unique Saturdays: {len(saturdays)} weeks")
-        print(f"  First: {saturdays[0].date()}, Last: {saturdays[-1].date()}")
+        # Test get_option_trading_days
+        option_days = engine.get_option_trading_days()
+        print(f"✓ Option trading days: {len(option_days)} days")
+        print(f"  First: {option_days[0].date()}, Last: {option_days[-1].date()}")
         
         # Test get_underlying_price
-        test_saturday = saturdays[10]
-        friday_price = engine.get_underlying_price(test_saturday, weekly=True)
-        print(f"✓ SPY Friday close (week of {test_saturday.date()}): ${friday_price:.2f}")
+        test_day = option_days[10]
+        test_price = engine.get_underlying_price(test_day, weekly=False)
+        print(f"✓ SPY close on {test_day.date()}: ${test_price:.2f}")
         
         # Test get_daily_dates
-        daily_dates = engine.get_daily_dates(test_saturday)
-        print(f"✓ Daily dates for week: {[d.date() for d in daily_dates]}")
+        next_day = option_days[11] if len(option_days) > 11 else None
+        daily_dates = engine.get_daily_dates(test_day, next_day)
+        print(f"✓ Daily rebalancing dates between option trades: {[d.date() for d in daily_dates]}")
         
         # Test get_interest_rate
-        test_monday = daily_dates[0]
-        rate = engine.get_interest_rate(test_monday)
-        print(f"✓ Risk-free rate on {test_monday.date()}: {rate:.4f}")
+        if len(daily_dates) > 0:
+            test_rebal_day = daily_dates[0]
+            rate = engine.get_interest_rate(test_rebal_day)
+            print(f"✓ Risk-free rate on {test_rebal_day.date()}: {rate:.4f}")
+        else:
+            rate = engine.get_interest_rate(test_day)
+            print(f"✓ Risk-free rate on {test_day.date()}: {rate:.4f}")
         
         # ========================================
         # TEST 7: BacktestEngine - Delta Rebalancing
@@ -671,21 +786,23 @@ if __name__ == "__main__":
             quantity=20,
             price=3.00,
             trade_type='option',
-            timestamp=test_saturday,
-            strike=float(int(friday_price)),
-            expiry=test_saturday + timedelta(days=7),
+            timestamp=test_day,
+            strike=float(int(test_price)),
+            expiry=test_day + timedelta(days=7),
             option_type='call'
         )
         engine.portfolio.execute_trade(test_option, apply_costs=False)
         
         initial_cash = engine.portfolio.cash
-        print(f"✓ Added 20 call options at strike ${int(friday_price)}")
+        print(f"✓ Added 20 call options at strike ${int(test_price)}")
         print(f"✓ Portfolio cash before rebalance: ${initial_cash:,.2f}")
         
-        # Rebalance delta
-        engine.rebalance_delta(test_monday, friday_price, rate)
+        # Rebalance delta on a rebalancing day or the test day itself
+        rebal_day = daily_dates[0] if len(daily_dates) > 0 else test_day
+        rebal_price = engine.get_underlying_price(rebal_day, weekly=False)
+        engine.rebalance_delta(rebal_day, rebal_price, rate)
         
-        final_delta = engine.portfolio.get_portfolio_delta(friday_price, rate, test_monday)
+        final_delta = engine.portfolio.get_portfolio_delta(rebal_price, rate, rebal_day)
         print(f"✓ Delta rebalance executed")
         print(f"✓ Final portfolio delta: {final_delta:.2f} shares")
         print(f"✓ Portfolio positions: {len(engine.portfolio.positions)}")

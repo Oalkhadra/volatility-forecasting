@@ -19,9 +19,10 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ..pricing.pricer import black_scholes_price, intrinsic_value
-from ..pricing.greeks import delta, calculate_all_greeks
+from ..pricing.greeks import delta, implied_volatility
 from ..volatility.forecasting import GARCHForecaster, MLForecaster
 from ..volatility.surface import VolatilitySurface
+from ..volatility.historical import RollingVolCalculator
 from ..backtest.engine import Trade
 
 @dataclass
@@ -47,47 +48,9 @@ class TradeSignal:
     timestamp: datetime
     underlying_price: float
     dte: float               # Days to expiry
+    implied_vol: float       # Store IV for daily rebalancing
 
-class BaseStrategy(ABC):
-    """Abstract base class for all strategies."""
-    
-    @abstractmethod
-    def generate_signals(self, 
-                        portfolio, 
-                        options_snapshot: pd.DataFrame,
-                        underlying_price: float,
-                        current_date: datetime,
-                        risk_free_rate: float) -> List[TradeSignal]:
-        """
-        Core logic: Compare theo vs market, generate trades.
-        
-        Args:
-            portfolio: Current Portfolio object
-            options_snapshot: DataFrame of available options for this date
-            underlying_price: Current SPY price
-            current_date: Current date
-            risk_free_rate: Current risk-free rate
-            
-        Returns:
-            List of TradeSignal objects
-        """
-        pass
-    
-    @abstractmethod
-    def create_trade_from_signal(self, signal: TradeSignal, trade_type: str) -> Trade:
-        """
-        Convert a TradeSignal to a Trade object.
-        
-        Args:
-            signal: TradeSignal to convert
-            trade_type: 'option' or 'stock' (for hedge)
-            
-        Returns:
-            Trade object ready for execution
-        """
-        pass
-
-class MispricingStrategy(BaseStrategy):
+class MispricingStrategy():
     """
     Strategy that trades based on mispricing between theoretical and market prices.
     
@@ -108,6 +71,8 @@ class MispricingStrategy(BaseStrategy):
     def __init__(self, 
                  vol_model,
                  returns_data: Optional[pd.Series] = None,
+                 options_data: Optional[pd.DataFrame] = None,
+                 prices_data: Optional[pd.DataFrame] = None,
                  threshold: float = 0.10,
                  max_positions: int = 5,
                  contracts_per_trade: int = 1):
@@ -116,6 +81,9 @@ class MispricingStrategy(BaseStrategy):
         
         Args:
             vol_model: Volatility forecasting model (GARCH, ML, Historical, or Surface)
+            returns_data: Historical returns for GARCH/ML models
+            options_data: Full options dataset for vol surface refitting
+            prices_data: Price data for historical volatility calculator
             threshold: Minimum mispricing % to trade (e.g., 0.10 = 10%)
             max_positions: Maximum number of option positions to hold
             contracts_per_trade: Number of contracts per trade
@@ -123,6 +91,8 @@ class MispricingStrategy(BaseStrategy):
         self.vol_model = vol_model
         self.threshold = threshold
         self.returns_data = returns_data
+        self.options_data = options_data
+        self.prices_data = prices_data
         self.max_positions = max_positions
         self.contracts_per_trade = contracts_per_trade
         self.model_name = vol_model.__class__.__name__
@@ -133,7 +103,7 @@ class MispricingStrategy(BaseStrategy):
                             T: float, 
                             r: float, 
                             option_type: str,
-                            returns_data: Optional[pd.Series] = None) -> Tuple[float, float]:
+                            current_date: datetime) -> Tuple[float, float]:
         """
         Calculate theoretical option price using the vol model.
 
@@ -173,8 +143,15 @@ class MispricingStrategy(BaseStrategy):
         if isinstance(self.vol_model, VolatilitySurface):
             sigma = self.vol_model.get_vol(K, S, (T*365)) # Ensure days/years unit is proper!!!!
         
-        # --------------------------------------------------------------------------------------------- IMPLEMENT OTHER VOL MODELING
-        else: # Use historical volatility if no modeling class is defined
+        elif isinstance(self.vol_model, RollingVolCalculator):
+            # Get current volatility estimate from historical calculator
+            sigma = self.vol_model.get_current_vol(current_date)
+            if sigma is None:
+                # Not enough data yet, use a default
+                sigma = 0.2
+        
+        # --------------------------------------------------------------------------------------------- IMPLEMENT OTHER VOL MODELING (GARCH, ML)
+        else: # Use scalar volatility if provided
             sigma = self.vol_model
 
 
@@ -186,6 +163,56 @@ class MispricingStrategy(BaseStrategy):
 
         return theo, sigma
 
+    def update_vol_model(self, current_date: datetime) -> None:
+        """
+        Update vol model with data available up to current_date.
+        
+        For VolatilitySurface: Refit surface weekly
+        For GARCH/ML: Could refit with expanding window.
+        For Historical vol: No need to update, calculated when needed
+        
+        Args:
+            current_date: Current date in backtest
+        """
+        if isinstance(self.vol_model, VolatilitySurface) and self.options_data is not None:
+            if self.options_data['date'].dtype == 'object':
+                self.options_data['date'] = pd.to_datetime(self.options_data['date'])
+
+            previous_trading_days = self.options_data[
+                self.options_data['date'] < current_date
+            ]['date'].unique()
+
+            if len(previous_trading_days) > 0:
+                most_recent_previous_date = previous_trading_days[-1]
+
+            historical_options = self.options_data[
+                self.options_data['date'] == most_recent_previous_date
+            ].copy()
+
+            if len(historical_options) > 0:
+                # Calculate market IV for each option if not already present
+                if 'vol' not in historical_options.columns:
+                    # Calculate IV from mid_price
+                    ivs = []
+                    for _, row in historical_options.iterrows():
+                        try:
+                            iv = implied_volatility(
+                                option_price=row['mid_price'],
+                                S=row['underlying_price'],
+                                K=row['strike'],
+                                T=row['days_to_expiry'] / 365,
+                                r=row.get('risk_free_rate', 0.02),
+                                option_type=row['call_put']
+                            )
+                            ivs.append(iv)
+                        except:
+                            ivs.append(0.2)  # Default fallback
+                    
+                    historical_options['vol'] = ivs
+                
+                # Refit surface on historical data only
+                self.vol_model.fit(historical_options)
+    
     def generate_signals(self, 
                         portfolio, 
                         options_snapshot: pd.DataFrame,
@@ -219,56 +246,87 @@ class MispricingStrategy(BaseStrategy):
             new_position_count = self.max_positions - num_current_positions
 
         
-        # Step 2: Loop through options and find mispricings
-        for _, row in tqdm(options_snapshot.iterrows()):
-            # Extract option data
-            symbol = row['act_symbol']
-            option_K = row['strike']
-            option_T = row['days_to_expiry'] / 365
-            option_type = row['call_put']
-            option_bid = row['bid']
-            option_ask = row['ask']
-            option_mid = row['mid_price']
-            option_expiry=row['expiration']
-            option_theo, option_sigma = self.calculate_theo_price(S=underlying_price, 
-                                                    K=option_K,
-                                                    T=option_T,
-                                                    r=risk_free_rate,
-                                                    option_type=option_type)
-            # Calculate mispricing and compare to determined threshold
-            mispricing_pct = (option_mid - option_theo) / option_theo
-
-            if abs(mispricing_pct) > self.threshold:
-                dec = 'sell' if option_mid > option_theo else 'buy'
-                
-                # Calculate delta for hedging
-                option_delta = delta(S=underlying_price, 
-                                     K=option_K,
-                                     T=option_T,
-                                     r=risk_free_rate,
-                                     sigma=option_sigma,  # Does it make sense to use the calculated IV? For the Theo? Unsure...
-                                     option_type=option_type)
-
-                contract_qty = self.contracts_per_trade if dec == 'buy' else -self.contracts_per_trade
-
-                hedge_qty = -option_delta * 100 * contract_qty
-
-                opt_signal = TradeSignal(
-                                        symbol,
-                                        action=dec,
-                                        quantity=contract_qty,
-                                        market_price=option_mid,
-                                        theo_price=option_theo,
-                                        mispricing_pct=mispricing_pct,
-                                        strike=option_K,
-                                        expiry=option_expiry,
-                                        option_type=option_type,
-                                        delta=option_delta,
-                                        hedge_quantity=hedge_qty,
-                                        timestamp=current_date,
-                                        underlying_price=underlying_price,
-                                        dte=option_T)
-                signals.append(opt_signal)
+        # Step 2: Calculate mispricings using calculate_theo_price method
+        if len(options_snapshot) == 0:
+            return []
+        
+        # Create a copy to avoid modifying original
+        df = options_snapshot.copy()
+        
+        # Calculate time to expiry in years
+        df['T'] = df['days_to_expiry'] / 365
+        
+        # Calculate theoretical prices and sigmas using calculate_theo_price
+        # This ensures all volatility models (GARCH, ML, Surface, Historical) are handled correctly
+        theo_prices = []
+        sigmas = []
+        
+        for _, row in df.iterrows():
+            theo_price, sigma = self.calculate_theo_price(
+                S=underlying_price,
+                K=row['strike'],
+                T=row['T'],
+                r=risk_free_rate,
+                option_type=row['call_put'],
+                current_date=current_date
+            )
+            theo_prices.append(theo_price)
+            sigmas.append(sigma)
+        
+        df['theo_price'] = theo_prices
+        df['sigma'] = sigmas
+        
+        # Calculate mispricing percentage (vectorized)
+        df['mispricing_pct'] = (df['mid_price'] - df['theo_price']) / df['theo_price']
+        
+        # Filter for mispricings above threshold (vectorized)
+        df_mispriced = df[df['mispricing_pct'].abs() > self.threshold].copy()
+        
+        if len(df_mispriced) == 0:
+            return []
+        
+        # Determine action (vectorized)
+        df_mispriced['action'] = np.where(df_mispriced['mispricing_pct'] > 0, 'sell', 'buy')
+        
+        # Calculate deltas (vectorized delta calculation)
+        df_mispriced['delta'] = np.array([
+            delta(underlying_price, K, T, risk_free_rate, sig, opt_type)
+            for K, T, sig, opt_type in zip(
+                df_mispriced['strike'].values,
+                df_mispriced['T'].values,
+                df_mispriced['sigma'].values,
+                df_mispriced['call_put'].values
+            )
+        ])
+        
+        # Calculate quantities and hedges (vectorized)
+        df_mispriced['contract_qty'] = np.where(
+            df_mispriced['action'] == 'buy',
+            self.contracts_per_trade,
+            -self.contracts_per_trade
+        )
+        df_mispriced['hedge_qty'] = -df_mispriced['delta'] * 100 * df_mispriced['contract_qty']
+        
+        # Create TradeSignal objects from the filtered dataframe (still needs loop for object creation)
+        for _, row in df_mispriced.iterrows():
+            opt_signal = TradeSignal(
+                symbol=row['act_symbol'],
+                action=row['action'],
+                quantity=row['contract_qty'],
+                market_price=row['mid_price'],
+                theo_price=row['theo_price'],
+                mispricing_pct=row['mispricing_pct'],
+                strike=row['strike'],
+                expiry=row['expiration'],
+                option_type=row['call_put'],
+                delta=row['delta'],
+                hedge_quantity=row['hedge_qty'],
+                timestamp=current_date,
+                underlying_price=underlying_price,
+                dte=row['T'],
+                implied_vol=row['sigma']
+            )
+            signals.append(opt_signal)
 
         # Sort by mispricing magnitude and Return top N signals
         signals.sort(key=lambda x: abs(x.mispricing_pct), reverse=True)
@@ -325,7 +383,8 @@ class MispricingStrategy(BaseStrategy):
                 timestamp=signal.timestamp,
                 strike=signal.strike,
                 expiry=signal.expiry,
-                option_type=signal.option_type
+                option_type=signal.option_type,
+                implied_vol=signal.implied_vol
             )
             
         elif trade_type == 'stock':
@@ -353,58 +412,3 @@ class MispricingStrategy(BaseStrategy):
 def create_option_key(symbol: str, strike: float, expiry: datetime, option_type: str) -> str:
     """Create unique identifier for an option."""
     return f"{symbol}_{strike:.0f}{option_type[0].upper()}_{expiry.strftime('%Y%m%d')}"
-
-
-
-def count_option_positions(portfolio) -> int:
-    """
-    Count number of option positions in portfolio.
-    
-    Helper function for position management.
-    
-    Args:
-        portfolio: Portfolio object from engine.py
-        
-    Returns:
-        Number of option positions (not stock positions)
-        
-    TODO: IMPLEMENT THIS (EASY)
-    
-    Hint: Loop through portfolio.positions, count where position_type == 'option'
-    """
-    # TODO: YOUR CODE HERE
-    return 0
-
-
-def calculate_signal_quality_metrics(signals: List[TradeSignal]) -> Dict[str, float]:
-    """
-    Calculate metrics about signal quality for analysis.
-    
-    This is OPTIONAL but useful for Phase 5 analysis.
-    
-    Args:
-        signals: List of TradeSignal objects
-        
-    Returns:
-        Dict with metrics:
-            - avg_mispricing: Average absolute mispricing
-            - max_mispricing: Largest mispricing
-            - avg_delta: Average absolute delta
-            - num_calls: Number of call signals
-            - num_puts: Number of put signals
-            - num_buys: Number of buy signals
-            - num_sells: Number of sell signals
-    """
-    if not signals:
-        return {
-            'avg_mispricing': 0.0,
-            'max_mispricing': 0.0,
-            'avg_delta': 0.0,
-            'num_calls': 0,
-            'num_puts': 0,
-            'num_buys': 0,
-            'num_sells': 0
-        }
-    
-    # TODO: OPTIONAL - Implement for analysis
-    pass

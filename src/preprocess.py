@@ -7,7 +7,7 @@ This script queries the Dolt database and saves processed data to parquet files.
 import subprocess
 import pandas as pd
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional
 from io import StringIO
 import yfinance as yf
 from pricing.risk_free_rate import get_risk_free_rate
@@ -15,8 +15,8 @@ from pricing.risk_free_rate import get_risk_free_rate
 # Constants
 DOLT_REPO_PATH = "data/raw/options"
 OUTPUT_DIR = "data/processed"
-START = '2019-06-03'
-END = '2020-12-31'
+START = '2023-01-01'
+END = '2025-12-01'
 
 def run_dolt_query(query: str, repo_path: str = DOLT_REPO_PATH) -> pd.DataFrame:
     """
@@ -273,6 +273,50 @@ def merge_underlying_prices(
     return merged_df
 
 
+def filter_arbitrage_violations(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Filter out options with prices below intrinsic value (arbitrage violations).
+
+    Args:
+        df: Options dataframe with 'underlying_price', 'strike', 'call_put', 
+            'bid', 'ask', 'mid_price' columns
+        
+    Returns:
+        Filtered dataframe with arbitrage violations removed
+    """
+    # Calculate intrinsic value
+    def calc_intrinsic(row):
+        S = row['underlying_price']
+        K = row['strike']
+        option_type = row['call_put'].lower()
+        
+        if option_type == 'call':
+            return max(S - K, 0)
+        else:  # put
+            return max(K - S, 0)
+    
+    df['intrinsic_value'] = df.apply(calc_intrinsic, axis=1)
+    
+    # Count violations before filtering
+    total_before = len(df)
+        
+    # Rigorous filter: BID must be > intrinsic (what you'd actually pay)
+    bid_filter = df['bid'] > (df['intrinsic_value'])
+
+    filtered_df = df[bid_filter].copy()
+    
+    violations_removed = total_before - len(filtered_df)
+    
+    if violations_removed > 0:
+        pct_removed = (violations_removed / total_before) * 100
+        print(f"    Filtered {violations_removed:,} arbitrage violations ({pct_removed:.2f}%)")
+    
+    # Drop the temporary column
+    filtered_df = filtered_df.drop(columns=['intrinsic_value'])
+    
+    return filtered_df
+
+
 def merge_risk_free_rate(
     options_df: pd.DataFrame,
     rf_df: pd.DataFrame
@@ -406,6 +450,10 @@ def process_ticker(
         ticker
     )
     
+    # Step 6b: Filter arbitrage violations (data quality issues)
+    print(f"  Filtering arbitrage violations...")
+    clean_options_df = filter_arbitrage_violations(clean_options_df)
+    
     # Step 7: Merge risk-free rate with options data
     print(f"  Merging risk-free rate...")
     clean_options_df = merge_risk_free_rate(
@@ -424,6 +472,9 @@ def process_ticker(
     options_filename = f"{ticker.lower()}_options"
     save_to_parquet(clean_options_df, options_filename)
     
+    rfr_filename = 'risk_free_rate'
+    save_to_parquet(rf_df, rfr_filename)
+
     if not clean_vol_df.empty:
         vol_filename = f"{ticker.lower()}_volatility"
         save_to_parquet(clean_vol_df, vol_filename)

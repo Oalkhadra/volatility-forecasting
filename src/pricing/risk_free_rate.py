@@ -34,7 +34,7 @@ def get_risk_free_rate(
     try:
         # Download data using yfinance
         print(f"  Downloading {tenor} treasury rate data...")
-        rf_data = yf.download(tenor, start=start_date, end=end_date, progress=False)
+        rf_data = yf.download(tenor, start=start_date, end=end_date, progress=False, auto_adjust=False)
         
         if rf_data.empty:
             print("  Warning: No treasury data available, using constant 2.0%")
@@ -43,6 +43,11 @@ def get_risk_free_rate(
         # Reset index and extract date
         rf_data = rf_data.reset_index()
         
+        # Flatten MultiIndex columns if they exist
+        if isinstance(rf_data.columns, pd.MultiIndex):
+            rf_data.columns = [col[0] if col[0] else col[1] for col in rf_data.columns.values]
+      
+
         # Yahoo returns rate as percentage (e.g., 1.50 for 1.5%)
         # Convert to decimal (0.015)
         rf_data['risk_free_rate'] = rf_data['Close'] / 100
@@ -55,10 +60,10 @@ def get_risk_free_rate(
         all_dates = pd.date_range(start_date, end_date, freq='D')
         full_df = pd.DataFrame({'date': all_dates.strftime('%Y-%m-%d')})
         merged = full_df.merge(rf_data, on='date', how='left')
-        merged['risk_free_rate'] = merged['risk_free_rate'].fillna(method='ffill')
-        
+        merged['risk_free_rate'] = merged['risk_free_rate'].ffill()
+
         # Backward fill any leading NaNs
-        merged['risk_free_rate'] = merged['risk_free_rate'].fillna(method='bfill')
+        merged['risk_free_rate'] = merged['risk_free_rate'].bfill()
         
         print(f"  ✓ Downloaded rate data: mean={merged['risk_free_rate'].mean():.4f}")
         
