@@ -160,6 +160,7 @@ class Portfolio:
             )
             self.positions[pos_key] = new_pos
         
+
     def mark_to_market(self, current_prices: Dict[str, float], date: datetime):
         """
         Update all positions with current market prices.
@@ -266,8 +267,8 @@ class Portfolio:
         
         for _, pos in self.positions.items():
             if pos.position_type == 'option':
-                # Calculate time to expiry in years
-                T = max(0, relativedelta(pos.expiry, current_date).days / 365.0)
+                # Calculate time to expiry in years (use total days, not just day component)
+                T = max(0, (pos.expiry - current_date).days / 365.0)
                 
 
                 # Use stored IV instead of recalculating
@@ -289,7 +290,6 @@ class Portfolio:
                         print("Defaulting to 0.2 Vol")
                         sigma = 0.2
 
-
                 # Get option delta
                 greeks = calculate_all_greeks(
                     S=S,
@@ -300,8 +300,14 @@ class Portfolio:
                     option_type=pos.option_type
                 )
                 
+                # Debug: Check for unreasonable delta values
+                delta_contribution = pos.quantity * greeks['delta'] * 100
+                if abs(delta_contribution) < 0.01 and abs(pos.quantity) >= 1:
+                    print(f"WARNING: Tiny delta detected!\n Position: {pos.option_type}\n strike={pos.strike} \nunderlying = {S}\n qty={pos.quantity}")
+                    print(f"  T={T:.4f}, sigma={sigma:.4f}, delta={greeks['delta']:.6f},gamma={greeks['gamma']:.6f}, theta={greeks['theta']:.6f} contribution={delta_contribution:.6f}")
+                
                 # Delta contribution (per contract = 100 shares)
-                total_delta += pos.quantity * greeks['delta'] * 100
+                total_delta += delta_contribution
             else:
                 # Stock position
                 total_delta += pos.quantity
@@ -345,9 +351,12 @@ class BacktestEngine:
         options_df['call_put'] = options_df['call_put'].str.lower()
 
         # Filter data to backtest date range
-        options_df = options_df[options_df['date'] <= self.end_date]
-        prices_df = prices_df[prices_df['date'] <= self.end_date]
-        rfr_df = rfr_df[rfr_df['date'] <= self.end_date]
+        options_df = options_df[(options_df['date'] <= self.end_date) & (options_df['date'] >= self.start_date)]
+        prices_df = prices_df[(prices_df['date'] <= self.end_date) & (prices_df['date'] >= self.start_date)]
+        rfr_df = rfr_df[(rfr_df['date'] <= self.end_date) & (rfr_df['date'] >= self.start_date)]
+
+        # Calculate returns column for prices
+        prices_df['log_ret'] = np.log(prices_df['close'] / prices_df['close'].shift(1)) * 100
 
         self.options_data = options_df
         self.prices_data = prices_df
@@ -503,7 +512,7 @@ class BacktestEngine:
         print("Starting backtest...")
         
         # Get all days with option data
-        option_trading_days = self.get_option_trading_days()[5:] # Add 5 trade day buffer for backwards modeling approaches
+        option_trading_days = self.get_option_trading_days()[20:] # Add 5 trade day buffer for backwards modeling approaches
         print(f"Option trading days: {len(option_trading_days)}")
         print(f"First: {option_trading_days[0]}, Last: {option_trading_days[-1]}")
         
@@ -577,7 +586,7 @@ class BacktestEngine:
                 self.portfolio.mark_to_market(prices_dict, day)
         
         print("Backtest complete.")
-        return pd.DataFrame(self.portfolio.history)
+        return pd.DataFrame(self.portfolio.history), pd.DataFrame(self.portfolio.trade_log)
 
 
 

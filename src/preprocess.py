@@ -15,8 +15,8 @@ from pricing.risk_free_rate import get_risk_free_rate
 # Constants
 DOLT_REPO_PATH = "data/raw/options"
 OUTPUT_DIR = "data/processed"
-START = '2023-01-01'
-END = '2025-12-01'
+START = '2019-01-01'
+END = '2025-06-01'
 
 def run_dolt_query(query: str, repo_path: str = DOLT_REPO_PATH) -> pd.DataFrame:
     """
@@ -302,9 +302,9 @@ def filter_arbitrage_violations(df: pd.DataFrame) -> pd.DataFrame:
         
     # Rigorous filter: BID must be > intrinsic (what you'd actually pay)
     bid_filter = df['bid'] > (df['intrinsic_value'])
-
     filtered_df = df[bid_filter].copy()
     
+
     violations_removed = total_before - len(filtered_df)
     
     if violations_removed > 0:

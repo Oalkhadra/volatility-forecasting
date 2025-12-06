@@ -52,34 +52,17 @@ class GARCHForecaster:
             returns: pandas Series of returns (typically log returns)
             
         Estimates parameters ω, α, β by maximum likelihood.
-        
-        TODO: Implement GARCH fitting
-        
-        Two approaches:
-        
-        APPROACH 1 (EASIER): Use arch library
-            model = arch_model(returns, vol='Garch', p=1, q=1)
-            result = model.fit(disp='off')
-            self.omega = result.params['omega']
-            self.alpha = result.params['alpha[1]']
-            self.beta = result.params['beta[1]']
-            
-        Interview Question: "Explain GARCH parameters"
-            ω controls long-run vol level. α controls how much recent
-            shocks affect vol (ARCH effect). β controls persistence 
-            (how long high vol lasts). α+β close to 1 means highly
-            persistent volatility - typical for financial markets.
-            
-        Recommendation: Use arch library for Phase 3 to save time.
-        Implement from scratch if you want deeper understanding.
+
         """
         model = arch_model(returns, vol='GARCH', p=1, q=1)
-        result = model.fit()
+        result = model.fit(disp='off')
 
         self.omega = result.params['omega']
         self.alpha = result.params['alpha[1]']
         self.beta = result.params['beta[1]']
-        self.current_variance = (result.conditional_volatility.iloc[-1] / 100) ** 2
+        # Keep current_variance in percentage-squared scale to match omega
+        # (returns are in percentage scale, so arch parameters are too)
+        self.current_variance = result.conditional_volatility.iloc[-1] ** 2
         self.is_fitted = True
 
     def forecast(self, horizon: int = 1) -> float:
@@ -90,7 +73,7 @@ class GARCHForecaster:
             horizon: Forecast horizon in days
             
         Returns:
-            Forecasted annualized volatility
+            Forecasted annualized volatility (in decimal scale, e.g., 0.20 for 20%)
             
         GARCH(1,1) multi-step forecast:
             E[σ²_t+h] = E[σ²] + (α+β)^h * (σ²_t - E[σ²])
@@ -115,9 +98,13 @@ class GARCHForecaster:
         beta = self.beta
         current_var = self.current_variance
 
-        var_forecast = (omega / (1 - alpha - beta)) + (alpha + beta) ** horizon * (current_var - (omega / (1 - alpha - beta)))
+        # Calculate forecasted variance (in percentage-squared scale)
+        long_run_var = omega / (1 - alpha - beta)
+        var_forecast = long_run_var + (alpha + beta) ** horizon * (current_var - long_run_var)
 
-        return np.sqrt(var_forecast * 252)
+        # Convert to annualized volatility in decimal scale
+        # sqrt(var * 252) gives percentage scale, divide by 100 for decimal
+        return np.sqrt(var_forecast * 252) / 100
 
 
 class MLForecaster:

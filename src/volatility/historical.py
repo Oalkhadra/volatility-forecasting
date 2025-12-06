@@ -67,7 +67,7 @@ class RollingVolCalculator:
     Useful for backtesting - maintains state as new data arrives.
     """
     
-    def __init__(self, prices_data: pd.DataFrame = None, window: int = 30, annualize: bool = True):
+    def __init__(self,  window: int = 30, annualize: bool = True):
         """
         Initialize rolling vol calculator.
         
@@ -77,20 +77,15 @@ class RollingVolCalculator:
         """
         self.window = window
         self.annualize = annualize
-        self.prices = prices_data
 
-    def get_current_vol(self, current_date: datetime) -> Optional[float]:
+    def get_current_vol(self, prices_data: pd.DataFrame, current_date: datetime) -> Optional[float]:
         """
         Get current volatility estimate.
         
         Returns:
             Current vol, or None if insufficient data
         """
-
-        if self.prices['date'].dtype == 'object':
-                self.prices['date'] = pd.to_datetime(self.prices['date'])
-  
-        prices_current = self.prices[self.prices['date'] < current_date]
+        prices_current = prices_data[prices_data['date'] < current_date]
 
         if len(prices_current) < self.window:
             return None

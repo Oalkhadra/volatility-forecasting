@@ -48,50 +48,23 @@ CONFIG = {
     
     # Backtest parameters
     'start_date': datetime(2023 ,1, 1),
-    'end_date': datetime(2025, 12, 1),
+    'end_date': datetime(2025, 1, 1),
     'initial_capital': 100000.0,
     
     # Strategy parameters
-    'mispricing_threshold': 0.5,  # 50% mispricing required
-    'max_positions': 20,
+    'mispricing_threshold': 0.1,  # 50% mispricing required
+    'max_positions': 5,
     'contracts_per_trade': 1,
     
     # Model parameters
-    'garch_horizon': 7,  # 7-day forecast (weekly options)
     'ml_horizon': 7,
     'historical_window': 30,  # 30-day rolling window
     
     # Output
-    'results_dir': 'results/phase5',
+    'results_dir': 'results',
     'save_plots': True,
     'save_data': True
 }
-
-# ============================================================================
-# MODEL SETUP FUNCTIONS
-# ============================================================================
-
-def setup_garch_model(returns: pd.Series, horizon: int = 7) -> GARCHForecaster:
-    """
-    Setup GARCH forecasting model.
-    
-    Args:
-        returns: Historical return series
-        horizon: Forecast horizon in days
-        
-    Returns:
-        Fitted GARCHForecaster object
-        
-    TODO: IMPLEMENT THIS
-    
-    Hints:
-        - Create GARCHForecaster instance
-        - Fit to returns (use .fit() method)
-        - Return fitted model
-        - In backtest, you'll refit weekly with expanding window
-    """
-    # TODO: YOUR CODE HERE
-    raise NotImplementedError("TODO: Implement GARCH model setup")
 
 
 def setup_ml_model(returns: pd.Series, horizon: int = 7) -> MLForecaster:
@@ -122,10 +95,7 @@ def setup_ml_model(returns: pd.Series, horizon: int = 7) -> MLForecaster:
 # ============================================================================
 
 def run_single_backtest(model_name: str, 
-                       vol_model, 
-                       returns_data: pd.Series = None,
-                       options_data: pd.DataFrame = None,
-                       prices_data: pd.DataFrame = None) -> Tuple[pd.DataFrame, BacktestEngine]:
+                       vol_model) -> Tuple[pd.DataFrame, BacktestEngine]:
     """
     Run backtest for a single volatility model.
     
@@ -174,9 +144,8 @@ def run_single_backtest(model_name: str,
     # 3. Setup strategy
     strategy = MispricingStrategy(
         vol_model=vol_model,
-        returns_data=returns_data,
-        options_data=options_data,
-        prices_data=prices_data,
+        options_data=engine.options_data,
+        prices_data=engine.prices_data,
         threshold=CONFIG['mispricing_threshold'],
         max_positions=CONFIG['max_positions'],
         contracts_per_trade=CONFIG['contracts_per_trade']
@@ -184,10 +153,10 @@ def run_single_backtest(model_name: str,
     engine.set_strategy(strategy)
 
     # 4. Run backtest
-    results = engine.run()
+    results, trade_log = engine.run()
     print(f"  Complete! Final equity: ${results.iloc[-1]['equity']:,.2f}")
     
-    return results, engine
+    return results, engine, trade_log
 
 
 def run_all_backtests() -> Dict[str, Tuple[pd.DataFrame, BacktestEngine]]:
@@ -215,32 +184,31 @@ def run_all_backtests() -> Dict[str, Tuple[pd.DataFrame, BacktestEngine]]:
         
         return results
     """
-    # Load data
-    prices = pd.read_parquet(CONFIG['prices_path'])
-    options = pd.read_parquet(CONFIG['options_path'])
     
-    # Calculate returns and initialize results_dict
-    returns = np.log(prices['close'] / prices['close'].shift(1)).dropna()
+    # Initialize results_dict
     results = {}
 
-    # # # Run backtest for each modeling approach
+    ## Run backtest for each modeling approach
     # Historical (pass prices_data for volatility calculator updates)
-    hist_model = RollingVolCalculator(prices_data=prices, 
-                                        window=CONFIG['historical_window'], 
-                                        annualize=True)
-    results_df, engine = run_single_backtest('historical', hist_model, 
-                                             returns_data=None, 
-                                             options_data=None, 
-                                             prices_data=prices)
+
+    hist_model = RollingVolCalculator(window=CONFIG['historical_window'],annualize=True)
+    results_df, engine, trade_log = run_single_backtest('historical', 
+                                            hist_model)
     results['historical'] = (results_df, engine)
+    trade_log.to_csv('RolVol_trade_log.csv')
 
     # Volatility surface
     vol_surface = VolatilitySurface('polynomial')
-    results_df, engine = run_single_backtest('vol_surface', vol_surface, 
-                                             returns_data=None, 
-                                             options_data=options, 
-                                             prices_data=None)
+    results_df, engine, _ = run_single_backtest('vol_surface', 
+                                             vol_surface)
     results['vol_surface'] = (results_df, engine)
+
+    # GARCH model
+    garch = GARCHForecaster()
+    results_df, engine, trade_log = run_single_backtest('GARCH',
+                                             garch)
+    trade_log.to_csv('GARCH_trade_log.csv')
+    results['GARCH'] = (results_df, engine)
 
     return results
 
@@ -339,7 +307,7 @@ def create_metrics_comparison_table(all_results: Dict[str, Tuple[pd.DataFrame, B
 def plot_equity_curves(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngine]], 
                       save_path: str = None):
     """
-    Plot equity curves for all models on one chart.
+    Plot equity curves for all models on one chart with SPY buy-and-hold benchmark.
     
     Args:
         all_results: Dict mapping model_name -> (results_df, engine)
@@ -348,14 +316,41 @@ def plot_equity_curves(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngine
     """
     plt.figure(figsize=(12, 6))
     
+    # Get initial capital from first model's engine
+    first_engine = next(iter(all_results.values()))[1]
+    initial_capital = first_engine.portfolio.initial_capital
+    
+    # Plot all strategy equity curves
     for model_name, (results_df, _) in all_results.items():
         plt.plot(results_df['date'], results_df['equity'], 
                 label=model_name, linewidth=2)
     
-    plt.axhline(y=100000, color='gray', linestyle='--', 
+    # Calculate and plot SPY buy-and-hold benchmark
+    if first_engine.prices_data is not None:
+        prices_df = first_engine.prices_data.copy()
+        
+        # Get the actual trading dates from the first model's results
+        first_results_df = next(iter(all_results.values()))[0]
+        backtest_dates = first_results_df['date'].values
+        
+        # Filter prices to only dates in the backtest period
+        prices_df = prices_df[prices_df['date'].isin(backtest_dates)]
+        
+        if len(prices_df) > 0:
+            # Calculate buy-and-hold equity curve
+            first_price = prices_df.iloc[0]['close']
+            shares_bought = initial_capital / first_price
+            prices_df['spy_equity'] = shares_bought * prices_df['close']
+            
+            # Plot SPY buy-and-hold
+            plt.plot(prices_df['date'], prices_df['spy_equity'], 
+                    label='SPY Buy & Hold', linewidth=2, 
+                    linestyle='--', color='black', alpha=0.7)
+    
+    plt.axhline(y=initial_capital, color='gray', linestyle='--', 
                 alpha=0.5, label='Initial Capital')
     
-    plt.title('Equity Curves: All Models', fontsize=14, fontweight='bold')
+    plt.title('Equity Curves: All Models vs SPY Buy & Hold', fontsize=14, fontweight='bold')
     plt.xlabel('Date')
     plt.ylabel('Portfolio Equity ($)')
     plt.legend()

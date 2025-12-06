@@ -70,12 +70,11 @@ class MispricingStrategy():
     
     def __init__(self, 
                  vol_model,
-                 returns_data: Optional[pd.Series] = None,
                  options_data: Optional[pd.DataFrame] = None,
                  prices_data: Optional[pd.DataFrame] = None,
                  threshold: float = 0.10,
                  max_positions: int = 5,
-                 contracts_per_trade: int = 1):
+                 contracts_per_trade: int = 100):
         """
         Initialize mispricing strategy.
         
@@ -90,7 +89,6 @@ class MispricingStrategy():
         """
         self.vol_model = vol_model
         self.threshold = threshold
-        self.returns_data = returns_data
         self.options_data = options_data
         self.prices_data = prices_data
         self.max_positions = max_positions
@@ -142,10 +140,13 @@ class MispricingStrategy():
 
         if isinstance(self.vol_model, VolatilitySurface):
             sigma = self.vol_model.get_vol(K, S, (T*365)) # Ensure days/years unit is proper!!!!
-        
+
+        elif isinstance(self.vol_model, GARCHForecaster):
+            sigma = self.vol_model.forecast(horizon = T*365)
+
         elif isinstance(self.vol_model, RollingVolCalculator):
             # Get current volatility estimate from historical calculator
-            sigma = self.vol_model.get_current_vol(current_date)
+            sigma = self.vol_model.get_current_vol(self.prices_data, current_date)
             if sigma is None:
                 # Not enough data yet, use a default
                 sigma = 0.2
@@ -174,7 +175,7 @@ class MispricingStrategy():
         Args:
             current_date: Current date in backtest
         """
-        if isinstance(self.vol_model, VolatilitySurface) and self.options_data is not None:
+        if isinstance(self.vol_model, VolatilitySurface):
             if self.options_data['date'].dtype == 'object':
                 self.options_data['date'] = pd.to_datetime(self.options_data['date'])
 
@@ -212,7 +213,19 @@ class MispricingStrategy():
                 
                 # Refit surface on historical data only
                 self.vol_model.fit(historical_options)
-    
+
+
+        elif isinstance(self.vol_model, GARCHForecaster):
+            if self.prices_data['date'].dtype == 'object':
+                self.prices_data['date'] = pd.to_datetime(self.prices_data['date'])
+
+            # Filter to only historical price data
+            historical_prices = self.prices_data[self.prices_data['date'] < current_date]
+
+            # Fit GARCH forecaster on available data
+            ret_series = historical_prices['log_ret'].dropna()
+            self.vol_model.fit(ret_series)
+
     def generate_signals(self, 
                         portfolio, 
                         options_snapshot: pd.DataFrame,
@@ -282,6 +295,13 @@ class MispricingStrategy():
         # Filter for mispricings above threshold (vectorized)
         df_mispriced = df[df['mispricing_pct'].abs() > self.threshold].copy()
         
+
+        # In strategy.py, add filter before calculating deltas
+        df_mispriced = df_mispriced[
+            (df_mispriced['strike'] / underlying_price).between(0.95, 1.05)
+        ]
+
+
         if len(df_mispriced) == 0:
             return []
         
