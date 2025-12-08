@@ -8,7 +8,6 @@ This package contains three different approaches to estimating volatility:
 """
 
 from .historical import calculate_realized_volatility, RollingVolCalculator
-from .surface import fit_volatility_surface, VolatilitySurface
 from .forecasting import GARCHForecaster, MLForecaster
 
 __all__ = [

@@ -16,14 +16,13 @@ import sys
 import os
 
 # Add parent directory to path for imports
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ..pricing.pricer import black_scholes_price, intrinsic_value
-from ..pricing.greeks import delta, implied_volatility
-from ..volatility.forecasting import GARCHForecaster, MLForecaster
-from ..volatility.surface import VolatilitySurface
-from ..volatility.historical import RollingVolCalculator
-from ..backtest.engine import Trade
+from pricing.pricer import black_scholes_price, intrinsic_value
+from pricing.greeks import delta
+from volatility.forecasting import GARCHForecaster, MLForecaster
+from volatility.historical import RollingVolCalculator
+from backtest.engine import Trade
 
 @dataclass
 class TradeSignal:
@@ -74,7 +73,9 @@ class MispricingStrategy():
                  prices_data: Optional[pd.DataFrame] = None,
                  threshold: float = 0.10,
                  max_positions: int = 5,
-                 contracts_per_trade: int = 100):
+                 contracts_per_trade: int = 100,
+                 max_leverage: float = 3.0,
+                 max_position_pct: float = 0.50):
         """
         Initialize mispricing strategy.
         
@@ -85,7 +86,9 @@ class MispricingStrategy():
             prices_data: Price data for historical volatility calculator
             threshold: Minimum mispricing % to trade (e.g., 0.10 = 10%)
             max_positions: Maximum number of option positions to hold
-            contracts_per_trade: Number of contracts per trade
+            contracts_per_trade: Max number of contracts per trade (reduced if capital limits hit)
+            max_leverage: Maximum total capital usage / equity ratio (e.g., 3.0 = 3x)
+            max_position_pct: Maximum single position capital as % of equity
         """
         self.vol_model = vol_model
         self.threshold = threshold
@@ -93,7 +96,122 @@ class MispricingStrategy():
         self.prices_data = prices_data
         self.max_positions = max_positions
         self.contracts_per_trade = contracts_per_trade
+        self.max_leverage = max_leverage
+        self.max_position_pct = max_position_pct
         self.model_name = vol_model.__class__.__name__
+    
+    def calculate_capital_usage(self, portfolio) -> Tuple[float, float]:
+        """
+        Calculate current capital usage and equity.
+        
+        Capital usage is the actual capital tied up in positions:
+        - Long options: premium paid (entry_price * 100 * |contracts|)
+        - Short options: margin requirement (~20% of notional + premium)
+        - Stock positions: |shares| * price (with margin for shorts)
+        
+        Args:
+            portfolio: Portfolio object with current positions
+            
+        Returns:
+            Tuple of (capital_used, current_equity)
+        """
+        capital_used = 0.0
+        
+        for _, pos in portfolio.positions.items():
+            if pos.position_type == 'option':
+                if pos.quantity > 0:
+                    # Long option: capital = premium paid
+                    capital_used += abs(pos.quantity) * pos.entry_price * 100
+                else:
+                    # Short option: margin requirement (~20% of notional + premium received)
+                    notional = abs(pos.quantity) * pos.strike * 100
+                    margin = notional * 0.20 + abs(pos.quantity) * pos.current_price * 100
+                    capital_used += margin
+            else:
+                # Stock: full capital for long, margin for short
+                if pos.quantity > 0:
+                    capital_used += pos.quantity * pos.current_price
+                else:
+                    # Short stock margin (~50%)
+                    capital_used += abs(pos.quantity) * pos.current_price * 0.50
+        
+        # Calculate current equity (cash + positions value)
+        current_equity = portfolio.cash
+        for _, pos in portfolio.positions.items():
+            current_equity += pos.market_value()
+        
+        return capital_used, current_equity
+    
+    def calculate_position_size(self, 
+                               portfolio, 
+                               underlying_price: float,
+                               strike: float,
+                               option_price: float,
+                               option_delta: float,
+                               action: str) -> int:
+        """
+        Calculate the appropriate number of contracts based on risk limits.
+        
+        Uses actual capital requirements, not notional:
+        - Long options: premium cost
+        - Short options: margin requirement
+        - Delta hedge: stock purchase/short
+        
+        Args:
+            portfolio: Portfolio object
+            underlying_price: Current underlying price
+            strike: Option strike price
+            option_price: Option premium price
+            option_delta: Delta of the option
+            action: 'buy' or 'sell'
+            
+        Returns:
+            Number of contracts to trade (can be 0 if limits exceeded)
+        """
+        capital_used, current_equity = self.calculate_capital_usage(portfolio)
+        
+        if current_equity <= 0:
+            return 0
+
+        # Calculate available capital capacity
+        max_capital = current_equity * self.max_leverage
+        available_capital = max(0, max_capital - capital_used)
+        
+        # Calculate max single position capital
+        max_position_capital = current_equity * self.max_position_pct
+        
+        # Estimate capital required per contract based on action
+        if action == 'buy':
+            # Long option: pay premium
+            option_capital_per_contract = option_price * 100
+        else:
+            # Short option: margin requirement (~20% of notional + premium)
+            notional = strike * 100
+            option_capital_per_contract = notional * 0.20 + option_price * 100
+        
+        # Delta hedge capital: buying/shorting stock
+        # Stock position size = |delta| * 100 shares per contract
+        hedge_shares = abs(option_delta) * 100
+        hedge_capital_per_contract = hedge_shares * underlying_price * 0.5  # 50% margin for stock
+        
+        total_capital_per_contract = option_capital_per_contract + hedge_capital_per_contract
+        
+        # Calculate max contracts based on available capacity
+        if total_capital_per_contract > 0:
+            max_contracts_total = int(available_capital / total_capital_per_contract)
+            max_contracts_position = int(max_position_capital / option_capital_per_contract) if option_capital_per_contract > 0 else self.contracts_per_trade
+        else:
+            max_contracts_total = self.contracts_per_trade
+            max_contracts_position = self.contracts_per_trade
+        
+        # Take the minimum of all constraints
+        contracts = min(
+            self.contracts_per_trade,
+            max_contracts_total,
+            max_contracts_position
+        )
+        
+        return max(0, contracts)
         
     def calculate_theo_price(self, 
                             S: float, 
@@ -136,10 +254,7 @@ class MispricingStrategy():
         """
         # If at, or very near, expiration, return intrinsic value. It won't matter
         if T < 1e-6:
-            return intrinsic_value(S=S,K=K,option_type=option_type)
-
-        if isinstance(self.vol_model, VolatilitySurface):
-            sigma = self.vol_model.get_vol(K, S, (T*365)) # Ensure days/years unit is proper!!!!
+            return intrinsic_value(S=S,K=K,option_type=option_type), 0.0
 
         elif isinstance(self.vol_model, GARCHForecaster):
             sigma = self.vol_model.forecast(horizon = T*365)
@@ -163,6 +278,38 @@ class MispricingStrategy():
         theo = black_scholes_price(S=S,K=K,T=T,r=r, sigma=sigma,option_type=option_type)
 
         return theo, sigma
+    
+    def _vectorized_get_volatilities(self, df: pd.DataFrame, underlying_price: float, current_date: datetime) -> np.ndarray:
+        """
+        Vectorized volatility calculation for all options in dataframe.
+        
+        Args:
+            df: DataFrame with columns 'strike', 'T' (time to expiry in years), 'days_to_expiry', 'call_put'
+            underlying_price: Current underlying price
+            current_date: Current date
+            
+        Returns:
+            Array of volatilities for each option
+        """    
+        if isinstance(self.vol_model, GARCHForecaster):
+            # GARCH forecast is the same for all options at a given time
+            # Only horizon varies, but typically we use a single forecast
+            # For simplicity, use same vol for all (can be enhanced to vary by DTE)
+            single_sigma = self.vol_model.forecast(horizon=30)  # 30-day forecast
+            sigmas = np.full(len(df), single_sigma)
+        
+        elif isinstance(self.vol_model, RollingVolCalculator):
+            # Historical vol is the same for all options at a given time
+            single_sigma = self.vol_model.get_current_vol(self.prices_data, current_date)
+            if single_sigma is None:
+                single_sigma = 0.2
+            sigmas = np.full(len(df), single_sigma)
+        
+        else:
+            # Scalar volatility model - broadcast to all options
+            sigmas = np.full(len(df), float(self.vol_model))
+        
+        return sigmas
 
     def update_vol_model(self, current_date: datetime) -> None:
         """
@@ -175,47 +322,7 @@ class MispricingStrategy():
         Args:
             current_date: Current date in backtest
         """
-        if isinstance(self.vol_model, VolatilitySurface):
-            if self.options_data['date'].dtype == 'object':
-                self.options_data['date'] = pd.to_datetime(self.options_data['date'])
-
-            previous_trading_days = self.options_data[
-                self.options_data['date'] < current_date
-            ]['date'].unique()
-
-            if len(previous_trading_days) > 0:
-                most_recent_previous_date = previous_trading_days[-1]
-
-            historical_options = self.options_data[
-                self.options_data['date'] == most_recent_previous_date
-            ].copy()
-
-            if len(historical_options) > 0:
-                # Calculate market IV for each option if not already present
-                if 'vol' not in historical_options.columns:
-                    # Calculate IV from mid_price
-                    ivs = []
-                    for _, row in historical_options.iterrows():
-                        try:
-                            iv = implied_volatility(
-                                option_price=row['mid_price'],
-                                S=row['underlying_price'],
-                                K=row['strike'],
-                                T=row['days_to_expiry'] / 365,
-                                r=row.get('risk_free_rate', 0.02),
-                                option_type=row['call_put']
-                            )
-                            ivs.append(iv)
-                        except:
-                            ivs.append(0.2)  # Default fallback
-                    
-                    historical_options['vol'] = ivs
-                
-                # Refit surface on historical data only
-                self.vol_model.fit(historical_options)
-
-
-        elif isinstance(self.vol_model, GARCHForecaster):
+        if isinstance(self.vol_model, GARCHForecaster):
             if self.prices_data['date'].dtype == 'object':
                 self.prices_data['date'] = pd.to_datetime(self.prices_data['date'])
 
@@ -259,35 +366,45 @@ class MispricingStrategy():
             new_position_count = self.max_positions - num_current_positions
 
         
-        # Step 2: Calculate mispricings using calculate_theo_price method
+        # Step 2: Vectorized calculation of mispricings
         if len(options_snapshot) == 0:
             return []
         
         # Create a copy to avoid modifying original
         df = options_snapshot.copy()
         
-        # Calculate time to expiry in years
+        # Calculate time to expiry in years (vectorized)
         df['T'] = df['days_to_expiry'] / 365
         
-        # Calculate theoretical prices and sigmas using calculate_theo_price
-        # This ensures all volatility models (GARCH, ML, Surface, Historical) are handled correctly
-        theo_prices = []
-        sigmas = []
+        # Vectorized volatility calculation
+        df['sigma'] = self._vectorized_get_volatilities(df, underlying_price, current_date)
         
-        for _, row in df.iterrows():
-            theo_price, sigma = self.calculate_theo_price(
-                S=underlying_price,
-                K=row['strike'],
-                T=row['T'],
-                r=risk_free_rate,
-                option_type=row['call_put'],
-                current_date=current_date
-            )
-            theo_prices.append(theo_price)
-            sigmas.append(sigma)
+        # Handle near-expiration cases (vectorized)
+        near_expiry_mask = df['T'] < 1e-6
         
-        df['theo_price'] = theo_prices
-        df['sigma'] = sigmas
+        # Vectorized theoretical price calculation
+        # For near-expiry: use intrinsic value
+        # For normal cases: use Black-Scholes (vectorized via numpy arrays)
+        df['theo_price'] = np.where(
+            near_expiry_mask,
+            # Intrinsic value for near expiry (vectorized)
+            np.where(
+                df['call_put'] == 'call',
+                np.maximum(underlying_price - df['strike'], 0),
+                np.maximum(df['strike'] - underlying_price, 0)
+            ),
+            # Black-Scholes for normal cases
+            # Note: BS function uses numpy internally, so array inputs work efficiently
+            np.array([
+                black_scholes_price(underlying_price, K, T, risk_free_rate, sig, opt_type)
+                for K, T, sig, opt_type in zip(
+                    df['strike'].values,
+                    df['T'].values,
+                    df['sigma'].values,
+                    df['call_put'].values
+                )
+            ])
+        )
         
         # Calculate mispricing percentage (vectorized)
         df['mispricing_pct'] = (df['mid_price'] - df['theo_price']) / df['theo_price']
@@ -319,39 +436,84 @@ class MispricingStrategy():
             )
         ])
         
-        # Calculate quantities and hedges (vectorized)
-        df_mispriced['contract_qty'] = np.where(
-            df_mispriced['action'] == 'buy',
-            self.contracts_per_trade,
-            -self.contracts_per_trade
-        )
-        df_mispriced['hedge_qty'] = -df_mispriced['delta'] * 100 * df_mispriced['contract_qty']
+        # Sort by mispricing magnitude before position sizing
+        # This ensures best opportunities get capital first
+        df_mispriced = df_mispriced.sort_values('mispricing_pct', key=abs, ascending=False)
         
-        # Create TradeSignal objects from the filtered dataframe (still needs loop for object creation)
+        # Track running capital usage as we generate signals
+        # This prevents over-allocation when multiple signals are generated in one batch
+        capital_used, current_equity = self.calculate_capital_usage(portfolio)
+        running_capital_used = capital_used
+        
+        # Create TradeSignal objects with dynamic position sizing
         for _, row in df_mispriced.iterrows():
+            opt_delta = row['delta']
+            option_price = row['mid_price']
+            action = row['action']
+            strike = row['strike']
+            
+            # Calculate capital required for this trade
+            if action == 'buy':
+                option_capital = option_price * 100
+            else:
+                # Short option margin
+                option_capital = strike * 100 * 0.20 + option_price * 100
+            
+            # Hedge capital (50% margin for stock)
+            hedge_shares = abs(opt_delta) * 100
+            hedge_capital = hedge_shares * underlying_price * 0.5
+            
+            capital_per_contract = option_capital + hedge_capital
+            
+            # Check if we have capacity for at least 1 contract
+            max_capital = current_equity * self.max_leverage
+            available_capital = max(0, max_capital - running_capital_used)
+            max_position_capital = current_equity * self.max_position_pct
+            
+            if capital_per_contract > 0:
+                max_contracts_total = int(available_capital / capital_per_contract)
+                max_contracts_position = int(max_position_capital / option_capital) if option_capital > 0 else self.contracts_per_trade
+            else:
+                max_contracts_total = self.contracts_per_trade
+                max_contracts_position = self.contracts_per_trade
+            
+            contracts = min(self.contracts_per_trade, max_contracts_total, max_contracts_position)
+            
+            # Skip if we can't take any contracts due to capital limits
+            if contracts <= 0:
+                continue
+            
+            # Update running capital usage for next iteration
+            running_capital_used += contracts * capital_per_contract
+            
+            # Apply direction (buy = positive, sell = negative)
+            contract_qty = contracts if action == 'buy' else -contracts
+            hedge_qty = -opt_delta * 100 * contract_qty
+            
             opt_signal = TradeSignal(
                 symbol=row['act_symbol'],
-                action=row['action'],
-                quantity=row['contract_qty'],
-                market_price=row['mid_price'],
+                action=action,
+                quantity=contract_qty,
+                market_price=option_price,
                 theo_price=row['theo_price'],
                 mispricing_pct=row['mispricing_pct'],
-                strike=row['strike'],
+                strike=strike,
                 expiry=row['expiration'],
                 option_type=row['call_put'],
-                delta=row['delta'],
-                hedge_quantity=row['hedge_qty'],
+                delta=opt_delta,
+                hedge_quantity=hedge_qty,
                 timestamp=current_date,
                 underlying_price=underlying_price,
                 dte=row['T'],
                 implied_vol=row['sigma']
             )
             signals.append(opt_signal)
+            
+            # Stop if we've reached max new positions
+            if len(signals) >= new_position_count:
+                break
 
-        # Sort by mispricing magnitude and Return top N signals
-        signals.sort(key=lambda x: abs(x.mispricing_pct), reverse=True)
-
-        return signals[:new_position_count]
+        return signals
     
     def create_trade_from_signal(self, signal: TradeSignal, trade_type: str) -> Trade:
         """

@@ -99,8 +99,16 @@ class GARCHForecaster:
         current_var = self.current_variance
 
         # Calculate forecasted variance (in percentage-squared scale)
-        long_run_var = omega / (1 - alpha - beta)
-        var_forecast = long_run_var + (alpha + beta) ** horizon * (current_var - long_run_var)
+        persistence = alpha + beta
+        
+        # Handle IGARCH case (alpha + beta >= 1) where long-run variance is undefined
+        if persistence >= 0.9999:
+            # For IGARCH, variance forecast decays from current variance
+            # Use simplified forecast: current_var * persistence^horizon
+            var_forecast = current_var * (persistence ** horizon)
+        else:
+            long_run_var = omega / (1 - persistence)
+            var_forecast = long_run_var + (persistence ** horizon) * (current_var - long_run_var)
 
         # Convert to annualized volatility in decimal scale
         # sqrt(var * 252) gives percentage scale, divide by 100 for decimal

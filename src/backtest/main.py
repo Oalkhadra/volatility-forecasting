@@ -21,20 +21,21 @@ Output:
 
 import sys
 import os
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+# Add parent directory (src/) to path for absolute imports
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple
 
-from src.backtest.engine import BacktestEngine
-from src.backtest.strategy import MispricingStrategy
-from src.volatility.forecasting import GARCHForecaster, MLForecaster
-from src.volatility.surface import VolatilitySurface
-from src.volatility.historical import RollingVolCalculator
+from backtest.engine import BacktestEngine
+from backtest.strategy import MispricingStrategy
+from volatility.forecasting import GARCHForecaster, MLForecaster
+from volatility.historical import RollingVolCalculator
 
 # ============================================================================
 # CONFIGURATION
@@ -45,16 +46,21 @@ CONFIG = {
     'options_path': 'data/processed/spy_options.parquet',
     'prices_path': 'data/processed/spy_prices.parquet',
     'rates_path': 'data/processed/risk_free_rate.parquet',
+    'vix_path': 'data/processed/vix_data.parquet',
     
     # Backtest parameters
-    'start_date': datetime(2023 ,1, 1),
-    'end_date': datetime(2025, 1, 1),
-    'initial_capital': 100000.0,
+    'start_date': datetime(2023 ,12, 4),
+    'end_date': datetime(2024, 6, 30),
+    'initial_capital': 10000.0,
     
     # Strategy parameters
-    'mispricing_threshold': 0.1,  # 50% mispricing required
-    'max_positions': 5,
-    'contracts_per_trade': 1,
+    'mispricing_threshold': 0.25,  # 20% mispricing required
+    'max_positions': 10,
+    'contracts_per_trade': 1,     # Max contracts per trade (will be reduced if needed)
+    
+    # Risk management parameters
+    'max_leverage': 2.0,          # Max total capital usage / equity ratio
+    'max_position_pct': 0.50,     # Max single position as % of equity
     
     # Model parameters
     'ml_horizon': 7,
@@ -65,30 +71,6 @@ CONFIG = {
     'save_plots': True,
     'save_data': True
 }
-
-
-def setup_ml_model(returns: pd.Series, horizon: int = 7) -> MLForecaster:
-    """
-    Setup ML forecasting model.
-    
-    Args:
-        returns: Historical return series
-        horizon: Forecast horizon in days
-        
-    Returns:
-        Fitted MLForecaster object
-        
-    TODO: IMPLEMENT THIS
-    
-    Hints:
-        - Create MLForecaster instance with horizon
-        - Fit to returns (use .fit() method)
-        - Return fitted model
-        - In backtest, you'll refit weekly with expanding window
-    """
-    # TODO: YOUR CODE HERE
-    raise NotImplementedError("TODO: Implement ML model setup")
-
 
 # ============================================================================
 # BACKTEST EXECUTION
@@ -102,10 +84,7 @@ def run_single_backtest(model_name: str,
     Args:
         model_name: Name of the model (for logging)
         vol_model: Volatility model instance
-        returns_data: Historical returns (for ML/GARCH refitting)
-        options_data: Options data (for VolatilitySurface refitting)
-        prices_data: Price data (for Historical vol calculator)
-        
+ 
     Returns:
         Tuple of (results_df, engine)
 
@@ -148,7 +127,9 @@ def run_single_backtest(model_name: str,
         prices_data=engine.prices_data,
         threshold=CONFIG['mispricing_threshold'],
         max_positions=CONFIG['max_positions'],
-        contracts_per_trade=CONFIG['contracts_per_trade']
+        contracts_per_trade=CONFIG['contracts_per_trade'],
+        max_leverage=CONFIG['max_leverage'],
+        max_position_pct=CONFIG['max_position_pct']
     )
     engine.set_strategy(strategy)
 
@@ -185,30 +166,31 @@ def run_all_backtests() -> Dict[str, Tuple[pd.DataFrame, BacktestEngine]]:
         return results
     """
     
+    # Create trade logs directory if it doesn't exist
+    trade_logs_dir = os.path.join(CONFIG['results_dir'], 'trade_logs')
+    os.makedirs(trade_logs_dir, exist_ok=True)
+    
     # Initialize results_dict
     results = {}
 
     ## Run backtest for each modeling approach
     # Historical (pass prices_data for volatility calculator updates)
-
     hist_model = RollingVolCalculator(window=CONFIG['historical_window'],annualize=True)
     results_df, engine, trade_log = run_single_backtest('historical', 
                                             hist_model)
     results['historical'] = (results_df, engine)
-    trade_log.to_csv('RolVol_trade_log.csv')
-
-    # Volatility surface
-    vol_surface = VolatilitySurface('polynomial')
-    results_df, engine, _ = run_single_backtest('vol_surface', 
-                                             vol_surface)
-    results['vol_surface'] = (results_df, engine)
+    trade_log_path = os.path.join(trade_logs_dir, 'historical_trade_log.csv')
+    trade_log.to_csv(trade_log_path, index=False)
+    print(f"  Saved trade log to: {trade_log_path}")
 
     # GARCH model
     garch = GARCHForecaster()
     results_df, engine, trade_log = run_single_backtest('GARCH',
                                              garch)
-    trade_log.to_csv('GARCH_trade_log.csv')
     results['GARCH'] = (results_df, engine)
+    trade_log_path = os.path.join(trade_logs_dir, 'GARCH_trade_log.csv')
+    trade_log.to_csv(trade_log_path, index=False)
+    print(f"  Saved trade log to: {trade_log_path}")
 
     return results
 
@@ -286,7 +268,7 @@ def create_metrics_comparison_table(all_results: Dict[str, Tuple[pd.DataFrame, B
 
     for model_name, (results_df, _) in all_results.items():
         equity = results_df['equity']
-        metrics = calculate_performance_metrics(equity)
+        metrics = calculate_performance_metrics(equity, CONFIG['initial_capital'])
         metrics['Model'] = model_name
         metrics_list.append(metrics)
     
@@ -427,29 +409,90 @@ def plot_rolling_sharpe(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngin
 def plot_iv_comparison(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngine]],
                       save_path: str = None):
     """
-    Plot implied volatility predictions from all models over time.
+    Plot implied volatility predictions from all models over time with VIX benchmark.
     
     Args:
         all_results: Dict mapping model_name -> (results_df, engine)
         save_path: Path to save figure (optional)
     
-    Shows how different volatility forecasting models predict IV over time.
+    Shows how different volatility forecasting models predict IV over time
+    compared to the VIX (market's volatility expectation).
     Useful for understanding model divergence and identifying regime changes.
     """
-    plt.figure(figsize=(14, 7))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), 
+                                     gridspec_kw={'height_ratios': [2, 1]})
     
+    # Load VIX data
+    try:
+        vix_df = pd.read_parquet(CONFIG['vix_path'])
+        vix_df['date'] = pd.to_datetime(vix_df['date'])
+        
+        # Filter VIX to backtest date range
+        vix_df = vix_df[
+            (vix_df['date'] >= CONFIG['start_date']) & 
+            (vix_df['date'] <= CONFIG['end_date'])
+        ]
+        
+        # Convert VIX from percentage to decimal (VIX of 12.92 -> 0.1292)
+        vix_df['vix_decimal'] = vix_df['vix_close'] / 100
+        
+        has_vix = True
+    except Exception as e:
+        print(f"Warning: Could not load VIX data: {e}")
+        has_vix = False
+    
+    # Plot 1: Implied Volatility Comparison
+    if has_vix:
+        # Plot VIX first as benchmark (thicker line)
+        ax1.plot(vix_df['date'], vix_df['vix_decimal'], 
+                label='VIX (Market Benchmark)', linewidth=3, 
+                color='black', linestyle='--', alpha=0.7, zorder=10)
+    
+    # Plot model predictions
     for model_name, (_, engine) in all_results.items():
         if engine.portfolio.iv_log:
             iv_df = pd.DataFrame(engine.portfolio.iv_log)
-            plt.plot(iv_df['date'], iv_df['implied_vol'], 
-                    label=model_name, linewidth=2, alpha=0.8)
+            iv_df['date'] = pd.to_datetime(iv_df['date'])
+            ax1.plot(iv_df['date'], iv_df['implied_vol'], 
+                    label=f'{model_name} (Predicted)', 
+                    linewidth=2, alpha=0.8)
     
-    plt.title('Implied Volatility Predictions: Model Comparison', 
-             fontsize=14, fontweight='bold')
-    plt.xlabel('Date')
-    plt.ylabel('Implied Volatility')
-    plt.legend()
-    plt.grid(alpha=0.3)
+    ax1.set_title('Implied Volatility: Model Predictions vs VIX', 
+                 fontsize=14, fontweight='bold')
+    ax1.set_xlabel('Date', fontsize=11)
+    ax1.set_ylabel('Implied Volatility (Annual)', fontsize=11)
+    ax1.legend(loc='best', fontsize=10)
+    ax1.grid(alpha=0.3)
+    
+    # Plot 2: Difference from VIX (Model Error)
+    if has_vix:
+        for model_name, (_, engine) in all_results.items():
+            if engine.portfolio.iv_log:
+                iv_df = pd.DataFrame(engine.portfolio.iv_log)
+                iv_df['date'] = pd.to_datetime(iv_df['date'])
+                
+                # Merge with VIX to calculate differences
+                merged = pd.merge(iv_df, vix_df[['date', 'vix_decimal']], 
+                                on='date', how='inner')
+                merged['iv_diff'] = merged['implied_vol'] - merged['vix_decimal']
+                
+                ax2.plot(merged['date'], merged['iv_diff'] * 100,  # Convert to percentage points
+                        label=f'{model_name}', linewidth=2, alpha=0.8)
+        
+        ax2.axhline(y=0, color='black', linestyle='--', linewidth=1.5, alpha=0.7)
+        ax2.set_title('Model Prediction Error (vs VIX)', 
+                     fontsize=12, fontweight='bold')
+        ax2.set_xlabel('Date', fontsize=11)
+        ax2.set_ylabel('Difference from VIX (percentage points)', fontsize=11)
+        ax2.legend(loc='best', fontsize=10)
+        ax2.grid(alpha=0.3)
+    else:
+        ax2.text(0.5, 0.5, 'VIX data not available', 
+                ha='center', va='center', fontsize=12, 
+                transform=ax2.transAxes)
+        ax2.set_title('Model Prediction Error (vs VIX) - Data Unavailable', 
+                     fontsize=12)
+    
     plt.tight_layout()
     
     if save_path:
@@ -504,6 +547,9 @@ def save_results_to_csv(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngin
         - {model_name}_iv_log.csv: Daily IV predictions for each model
         - combined_results.csv: All equity curves in one file
         - combined_iv.csv: All IV predictions in one file
+        
+    Note: Trade logs are saved separately in trade_logs/ subdirectory 
+          by run_all_backtests() function.
     """
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -516,21 +562,21 @@ def save_results_to_csv(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngin
     # Save individual equity curves, expiry logs, and IV logs
     for model_name, (results_df, engine) in all_results.items():
         # Save equity curve
-        equity_path = os.path.join(output_dir, f'{model_name}_equity.csv')
+        equity_path = os.path.join(output_dir, f'equity_logs/{model_name}_equity.csv')
         results_df.to_csv(equity_path, index=False)
         print(f"  Saved {model_name} equity curve to: {equity_path}")
         
         # Save expiry log if available
         if engine.portfolio.expiry_log:
             expiry_df = pd.DataFrame(engine.portfolio.expiry_log)
-            expiry_path = os.path.join(output_dir, f'{model_name}_expiry_log.csv')
+            expiry_path = os.path.join(output_dir, f'expiry_logs/{model_name}_expiry_log.csv')
             expiry_df.to_csv(expiry_path, index=False)
             print(f"  Saved {model_name} expiry log to: {expiry_path}")
         
         # Save IV log if available
         if engine.portfolio.iv_log:
             iv_df = pd.DataFrame(engine.portfolio.iv_log)
-            iv_path = os.path.join(output_dir, f'{model_name}_iv_log.csv')
+            iv_path = os.path.join(output_dir, f'IV_logs/{model_name}_iv_log.csv')
             iv_df.to_csv(iv_path, index=False)
             print(f"  Saved {model_name} IV log to: {iv_path}")
     
@@ -545,7 +591,7 @@ def save_results_to_csv(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngin
     combined_df.to_csv(combined_path, index=False)
     print(f"  Saved combined results to: {combined_path}")
     
-    # Save combined IV predictions (all models' IVs side-by-side)
+    # Save combined IV predictions (all models' IVs side-by-side with VIX)
     combined_iv_df = pd.DataFrame()
     for model_name, (_, engine) in all_results.items():
         if engine.portfolio.iv_log:
@@ -553,10 +599,30 @@ def save_results_to_csv(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngin
             if combined_iv_df.empty:
                 combined_iv_df['date'] = iv_df['date']
                 combined_iv_df['underlying_price'] = iv_df['underlying_price']
-                combined_iv_df['day_type'] = iv_df['day_type']
             combined_iv_df[f'{model_name}_iv'] = iv_df['implied_vol'].values
     
     if not combined_iv_df.empty:
+        # Add VIX data to combined IV dataframe
+        try:
+            vix_df = pd.read_parquet(CONFIG['vix_path'])
+            vix_df['date'] = pd.to_datetime(vix_df['date'])
+            combined_iv_df['date'] = pd.to_datetime(combined_iv_df['date'])
+            
+            # Merge VIX data
+            combined_iv_df = pd.merge(
+                combined_iv_df, 
+                vix_df[['date', 'vix_close']],
+                on='date', 
+                how='left'
+            )
+            
+            # Convert VIX to decimal format for comparison
+            combined_iv_df['vix_decimal'] = combined_iv_df['vix_close'] / 100
+            
+            print(f"  Added VIX data to combined IV predictions")
+        except Exception as e:
+            print(f"  Warning: Could not add VIX data to combined IV: {e}")
+        
         combined_iv_path = os.path.join(output_dir, 'combined_iv.csv')
         combined_iv_df.to_csv(combined_iv_path, index=False)
         print(f"  Saved combined IV predictions to: {combined_iv_path}")
@@ -583,10 +649,7 @@ def main():
     print("="*80)
     print("OPTIONS TRADING STRATEGY COMPARISON - PHASE 5")
     print("="*80)
-    print("\nConfiguration:")
-    for key, value in CONFIG.items():
-        print(f"  {key}: {value}")
-    
+
     # Run backtests
     print("\nStep 1: Running backtests...")
     all_results = run_all_backtests()
