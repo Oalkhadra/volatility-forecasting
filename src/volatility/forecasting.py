@@ -74,21 +74,7 @@ class GARCHForecaster:
             
         Returns:
             Forecasted annualized volatility (in decimal scale, e.g., 0.20 for 20%)
-            
-        GARCH(1,1) multi-step forecast:
-            E[σ²_t+h] = E[σ²] + (α+β)^h * (σ²_t - E[σ²])
-            
-        Where:
-            E[σ²] = ω / (1 - α - β) is unconditional variance
-            σ²_t is current conditional variance
-            
-        TODO: Implement GARCH forecast
-        
-        Hints:
-            1. Check if fitted
-            2. Long-run var: lr_var = ω / (1 - α - β)
-            3. Forecast: var_forecast = lr_var + (α+β)^h * (current_var - lr_var)
-            4. Return: sqrt(var_forecast * 252) for annualized vol
+
         """
         if not self.is_fitted:
             raise ValueError("Must call fit() before forecast()")

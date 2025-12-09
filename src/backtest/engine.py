@@ -77,6 +77,7 @@ class Trade:
     expiry: Optional[datetime] = None
     option_type: Optional[str] = None
     implied_vol: Optional[float] = None  # Store IV for daily rebalancing
+    delta: Optional[float] = None # Store calculated delta for trade log validations
     
     def get_key(self) -> str:
         """Get unique position key for this trade."""
@@ -94,6 +95,7 @@ class Portfolio:
         self.history: List[dict] = []
         self.trade_log: List[Trade] = []
         self.expiry_log: List[dict] = []  # Separate log for expiry events
+        self.early_exit_log: List[dict] = []  # Log for early exit events
         self.iv_log: List[dict] = []  # Daily IV predictions from the strategy
         
     def execute_trade(self, trade: Trade, apply_costs: bool = True):
@@ -252,6 +254,24 @@ class Portfolio:
             'underlying_price': underlying_price
         })
     
+    def log_early_exit(self, date: datetime, pos_key: str, exit_price: float, quantity: float):
+        """
+        Log early exit event for analysis.
+        
+        Args:
+            date: Exit date
+            pos_key: Position key that was closed
+            exit_price: Price at which position was closed
+            quantity: Quantity closed (negative of original position)
+        """
+        self.early_exit_log.append({
+            'date': date,
+            'event': 'early_exit',
+            'position_key': pos_key,
+            'exit_price': exit_price,
+            'quantity': quantity
+        })
+    
     def get_portfolio_delta(self, S: float, r: float, current_date: datetime) -> float:
         """
         Calculate total portfolio delta.
@@ -288,7 +308,7 @@ class Portfolio:
                     except Exception as e:
                         print(f"IV Calculation caused an error: {e}")
                         print("Defaulting to 0.2 Vol")
-                        sigma = 0.2
+                        sigma = 0.11
 
                 # Get option delta
                 greeks = calculate_all_greeks(
@@ -361,6 +381,34 @@ class BacktestEngine:
     def set_strategy(self, strategy):
         """Attach a strategy to the engine."""
         self.strategy = strategy
+    
+    def get_current_option_prices(self, options_snapshot: pd.DataFrame) -> Dict[str, float]:
+        """
+        Extract current market prices for all held options from the options snapshot.
+        
+        Args:
+            options_snapshot: DataFrame with today's option prices
+            
+        Returns:
+            Dictionary mapping position_key -> current mid_price
+        """
+        prices = {}
+        
+        for pos_key, pos in self.portfolio.positions.items():
+            if pos.position_type == 'option':
+                # Find this option in today's snapshot
+                option_match = options_snapshot[
+                    (options_snapshot['strike'] == pos.strike) &
+                    (options_snapshot['expiration'] == pos.expiry) &
+                    (options_snapshot['call_put'] == pos.option_type)
+                ]
+                
+                if len(option_match) > 0:
+                    # Use actual market mid_price
+                    prices[pos_key] = option_match.iloc[0]['mid_price']
+                # If not found, position keeps its last known price (mark_to_market handles this)
+        
+        return prices
     
     def rebalance_delta(self, current_date: datetime, underlying_price: float, r: float, ticker: str):
         """
@@ -459,7 +507,7 @@ class BacktestEngine:
         print("Starting backtest...")
         
         # Get all days with option data
-        trading_days = self.get_trading_days()[21:] # Add 5 trade day buffer for backwards modeling approaches
+        trading_days = self.get_trading_days()[5:] # Add 5 trade day buffer for backwards modeling approaches
        
         print(f"Trading days: {len(trading_days)}")
         print(f"First: {trading_days[0]}, Last: {trading_days[-1]}")
@@ -472,15 +520,33 @@ class BacktestEngine:
             
             # Handle expiries
             self.portfolio.handle_expiries(current_date, underlying_price)
-            
-            # Rebalance delta after expired positions are removed
-            self.rebalance_delta(current_date, underlying_price, current_rate, 'SPY')
 
             # Get options snapshot for this trading day
             options_snapshot = self.options_data[self.options_data['date'] == current_date]
             
             # Update vol model with historical data (walk-forward)
             self.strategy.update_vol_model(current_date)
+            
+            # Check for early exits (mispricing converged to fair value)
+            early_exit_trades = self.strategy.check_early_exits(
+                self.portfolio, options_snapshot, underlying_price, current_date, current_rate
+            )
+            
+            # Execute early exit trades
+            for trade in early_exit_trades:
+                self.portfolio.execute_trade(trade)
+                
+                # Log early exit event for analysis
+                if trade.trade_type == 'option':
+                    self.portfolio.log_early_exit(
+                        date=current_date,
+                        pos_key=trade.get_key(),
+                        exit_price=trade.price,
+                        quantity=trade.quantity
+                    )
+            
+            # Rebalance delta after expiries and early exits
+            self.rebalance_delta(current_date, underlying_price, current_rate, 'SPY')
             
             # Generate signals for this trading day
             signals = self.strategy.generate_signals(
@@ -513,8 +579,12 @@ class BacktestEngine:
             # Final delta rebalance after all trades to ensure neutrality
             self.rebalance_delta(current_date, underlying_price, current_rate, 'SPY')
             
-            # Mark to market after all trading activity
+            # Mark to market with actual option prices from market data
             prices_dict = {'SPY': underlying_price}
+
+            option_prices = self.get_current_option_prices(options_snapshot)
+            prices_dict.update(option_prices)
+            
             self.portfolio.mark_to_market(prices_dict, current_date)
         
         print("Backtest complete.")

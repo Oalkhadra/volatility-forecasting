@@ -1,0 +1,6 @@
+date,event,position_key,exit_price,quantity
+2024-05-29,early_exit,SPY_517P_20240603,0.395,-1
+2024-06-18,early_exit,SPY_552C_20240628,1.58,-8
+2024-06-20,early_exit,SPY_553C_20240628,0.75,-5
+2024-06-21,early_exit,SPY_554C_20240628,0.295,-5
+2024-09-10,early_exit,SPY_520P_20240916,0.14500000000000002,-1

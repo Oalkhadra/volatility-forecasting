@@ -72,10 +72,13 @@ class MispricingStrategy():
                  options_data: Optional[pd.DataFrame] = None,
                  prices_data: Optional[pd.DataFrame] = None,
                  threshold: float = 0.10,
+                 exit_threshold: float = 0.10,
                  max_positions: int = 5,
                  contracts_per_trade: int = 100,
-                 max_leverage: float = 3.0,
-                 max_position_pct: float = 0.50):
+                 max_leverage: float = 1.0,
+                 max_position_pct: float = 0.50,
+                 max_short_exposure: float = 0.50,
+                 risk_premium: float = 0.0):
         """
         Initialize mispricing strategy.
         
@@ -85,62 +88,73 @@ class MispricingStrategy():
             options_data: Full options dataset for vol surface refitting
             prices_data: Price data for historical volatility calculator
             threshold: Minimum mispricing % to trade (e.g., 0.10 = 10%)
+            exit_threshold: Mispricing % below which to exit early (e.g., 0.05 = 5%)
+                           Set to 0.0 to disable early exits (hold to expiry)
             max_positions: Maximum number of option positions to hold
             contracts_per_trade: Max number of contracts per trade (reduced if capital limits hit)
             max_leverage: Maximum total capital usage / equity ratio (e.g., 3.0 = 3x)
             max_position_pct: Maximum single position capital as % of equity
+            max_short_exposure: Maximum short position value as % of equity
+            risk_premium: Variance risk premium multiplier (e.g., 0.15 = add 15% to vol forecast)
+                         Set to 0.0 to disable. Applies to realized vol models (GARCH, Historical)
+                         Typical range: 0.10-0.30. Accounts for IV > RV on average.
         """
         self.vol_model = vol_model
         self.threshold = threshold
+        self.exit_threshold = exit_threshold
         self.options_data = options_data
         self.prices_data = prices_data
         self.max_positions = max_positions
         self.contracts_per_trade = contracts_per_trade
         self.max_leverage = max_leverage
         self.max_position_pct = max_position_pct
+        self.max_short_exposure = max_short_exposure
+        self.risk_premium = risk_premium
         self.model_name = vol_model.__class__.__name__
     
-    def calculate_capital_usage(self, portfolio) -> Tuple[float, float]:
+    def calculate_capital_usage(self, portfolio) -> Tuple[float, float, float]:
         """
-        Calculate current capital usage and equity.
+        Calculate current capital usage, short exposure, and equity.
         
-        Capital usage is the actual capital tied up in positions:
-        - Long options: premium paid (entry_price * 100 * |contracts|)
-        - Short options: margin requirement (~20% of notional + premium)
-        - Stock positions: |shares| * price (with margin for shorts)
+        Capital usage is the actual market value of all positions:
+        - Long options: quantity * current_price * 100
+        - Short options: quantity * current_price * 100 (absolute value)
+        - Long stock: quantity * current_price
+        - Short stock: quantity * current_price (absolute value)
         
         Args:
             portfolio: Portfolio object with current positions
             
         Returns:
-            Tuple of (capital_used, current_equity)
+            Tuple of (capital_used, short_exposure, current_equity)
         """
         capital_used = 0.0
+        short_exposure = 0.0
         
         for _, pos in portfolio.positions.items():
             if pos.position_type == 'option':
-                if pos.quantity > 0:
-                    # Long option: capital = premium paid
-                    capital_used += abs(pos.quantity) * pos.entry_price * 100
-                else:
-                    # Short option: margin requirement (~20% of notional + premium received)
-                    notional = abs(pos.quantity) * pos.strike * 100
-                    margin = notional * 0.20 + abs(pos.quantity) * pos.current_price * 100
-                    capital_used += margin
+                # Option value: quantity * price * 100 (multiplier)
+                position_value = abs(pos.quantity) * pos.current_price * 100
+                capital_used += position_value
+                
+                # Track short exposure separately
+                if pos.quantity < 0:
+                    short_exposure += position_value
             else:
-                # Stock: full capital for long, margin for short
-                if pos.quantity > 0:
-                    capital_used += pos.quantity * pos.current_price
-                else:
-                    # Short stock margin (~50%)
-                    capital_used += abs(pos.quantity) * pos.current_price * 0.50
+                # Stock value: quantity * price
+                position_value = abs(pos.quantity) * pos.current_price
+                capital_used += position_value
+                
+                # Track short stock exposure
+                if pos.quantity < 0:
+                    short_exposure += position_value
         
         # Calculate current equity (cash + positions value)
         current_equity = portfolio.cash
         for _, pos in portfolio.positions.items():
             current_equity += pos.market_value()
         
-        return capital_used, current_equity
+        return capital_used, short_exposure, current_equity
     
     def calculate_position_size(self, 
                                portfolio, 
@@ -152,10 +166,10 @@ class MispricingStrategy():
         """
         Calculate the appropriate number of contracts based on risk limits.
         
-        Uses actual capital requirements, not notional:
+        Uses actual position values:
         - Long options: premium cost
-        - Short options: margin requirement
-        - Delta hedge: stock purchase/short
+        - Short options: premium value
+        - Delta hedge: stock value
         
         Args:
             portfolio: Portfolio object
@@ -168,7 +182,7 @@ class MispricingStrategy():
         Returns:
             Number of contracts to trade (can be 0 if limits exceeded)
         """
-        capital_used, current_equity = self.calculate_capital_usage(portfolio)
+        capital_used, short_exposure, current_equity = self.calculate_capital_usage(portfolio)
         
         if current_equity <= 0:
             return 0
@@ -177,22 +191,19 @@ class MispricingStrategy():
         max_capital = current_equity * self.max_leverage
         available_capital = max(0, max_capital - capital_used)
         
+        # Calculate available short exposure capacity
+        max_short_capital = current_equity * self.max_short_exposure
+        available_short_capacity = max(0, max_short_capital - short_exposure)
+        
         # Calculate max single position capital
         max_position_capital = current_equity * self.max_position_pct
         
-        # Estimate capital required per contract based on action
-        if action == 'buy':
-            # Long option: pay premium
-            option_capital_per_contract = option_price * 100
-        else:
-            # Short option: margin requirement (~20% of notional + premium)
-            notional = strike * 100
-            option_capital_per_contract = notional * 0.20 + option_price * 100
+        # Estimate capital required per contract
+        option_capital_per_contract = option_price * 100
         
         # Delta hedge capital: buying/shorting stock
-        # Stock position size = |delta| * 100 shares per contract
         hedge_shares = abs(option_delta) * 100
-        hedge_capital_per_contract = hedge_shares * underlying_price * 0.5  # 50% margin for stock
+        hedge_capital_per_contract = hedge_shares * underlying_price
         
         total_capital_per_contract = option_capital_per_contract + hedge_capital_per_contract
         
@@ -204,11 +215,21 @@ class MispricingStrategy():
             max_contracts_total = self.contracts_per_trade
             max_contracts_position = self.contracts_per_trade
         
+        # For short positions, also check short exposure limit
+        if action == 'sell':
+            if option_capital_per_contract > 0:
+                max_contracts_short = int(available_short_capacity / option_capital_per_contract)
+            else:
+                max_contracts_short = self.contracts_per_trade
+        else:
+            max_contracts_short = self.contracts_per_trade  # No short limit for long positions
+        
         # Take the minimum of all constraints
         contracts = min(
             self.contracts_per_trade,
             max_contracts_total,
-            max_contracts_position
+            max_contracts_position,
+            max_contracts_short
         )
         
         return max(0, contracts)
@@ -264,7 +285,7 @@ class MispricingStrategy():
             sigma = self.vol_model.get_current_vol(self.prices_data, current_date)
             if sigma is None:
                 # Not enough data yet, use a default
-                sigma = 0.2
+                sigma = 0.11
         
         # --------------------------------------------------------------------------------------------- IMPLEMENT OTHER VOL MODELING (GARCH, ML)
         else: # Use scalar volatility if provided
@@ -274,12 +295,17 @@ class MispricingStrategy():
         if sigma < 0:
             print(f"Warning!! Negative vol produced: {sigma} // Check vol modeling method!")
 
+        # Apply variance risk premium adjustment
+        # This accounts for IV > RV on average - market prices in a premium for vol protection
+        if self.risk_premium > 0:
+            sigma = sigma * (1 + self.risk_premium)
+
         # Calculate theoretical price
         theo = black_scholes_price(S=S,K=K,T=T,r=r, sigma=sigma,option_type=option_type)
 
         return theo, sigma
     
-    def _vectorized_get_volatilities(self, df: pd.DataFrame, underlying_price: float, current_date: datetime) -> np.ndarray:
+    def _vectorized_get_volatilities(self, df: pd.DataFrame, current_date: datetime) -> np.ndarray:
         """
         Vectorized volatility calculation for all options in dataframe.
         
@@ -289,25 +315,36 @@ class MispricingStrategy():
             current_date: Current date
             
         Returns:
-            Array of volatilities for each option
+            Array of volatilities for each option (with risk premium applied)
         """    
         if isinstance(self.vol_model, GARCHForecaster):
             # GARCH forecast is the same for all options at a given time
-            # Only horizon varies, but typically we use a single forecast
-            # For simplicity, use same vol for all (can be enhanced to vary by DTE)
-            single_sigma = self.vol_model.forecast(horizon=30)  # 30-day forecast
+            if self.vol_model.is_fitted:
+                single_sigma = self.vol_model.forecast(horizon=30)  # 30-day forecast
+                
+                # First few days of GARCH will be extremely low, model improves over time!
+                if single_sigma < 0.08:                
+                    print(f"Warning! Modeled volatility {single_sigma} is too low, GARCH not fitted yet, using fallback!.")
+                    # Floor at 8% (SPY rarely goes below this, even in low-vol regimes)
+                    single_sigma = max(single_sigma, 0.08)
+                    
             sigmas = np.full(len(df), single_sigma)
         
         elif isinstance(self.vol_model, RollingVolCalculator):
             # Historical vol is the same for all options at a given time
             single_sigma = self.vol_model.get_current_vol(self.prices_data, current_date)
             if single_sigma is None:
-                single_sigma = 0.2
+                single_sigma = 0.11
             sigmas = np.full(len(df), single_sigma)
         
         else:
             # Scalar volatility model - broadcast to all options
             sigmas = np.full(len(df), float(self.vol_model))
+        
+        # Apply variance risk premium adjustment
+        # This accounts for IV > RV on average - market prices in a premium for vol protection
+        if self.risk_premium > 0:
+            sigmas = sigmas * (1 + self.risk_premium)
         
         return sigmas
 
@@ -332,6 +369,115 @@ class MispricingStrategy():
             # Fit GARCH forecaster on available data
             ret_series = historical_prices['log_ret'].dropna()
             self.vol_model.fit(ret_series)
+
+    def check_early_exits(self,
+                         portfolio,
+                         options_snapshot: pd.DataFrame,
+                         underlying_price: float,
+                         current_date: datetime,
+                         risk_free_rate: float = 0.02) -> List[Trade]:
+        """
+        Check if any positions should be closed early due to mispricing convergence.
+        
+        Exit when the option reaches fair value (mispricing < exit_threshold).
+        This allows the strategy to realize P&L early and redeploy capital.
+        
+        Args:
+            portfolio: Current Portfolio object with positions
+            options_snapshot: DataFrame with current day's option prices
+            underlying_price: Current SPY price
+            current_date: Current date
+            risk_free_rate: Risk-free rate
+            
+        Returns:
+            List of Trade objects to close positions (both option and hedge)
+        """
+        closing_trades = []
+        
+        # Early exit disabled if threshold is 0
+        if self.exit_threshold <= 0:
+            return []
+        
+        # Loop through all option positions
+        for pos_key, pos in list(portfolio.positions.items()):
+            if pos.position_type != 'option':
+                continue
+            
+            # Find current market price for this option
+            option_match = options_snapshot[
+                (options_snapshot['strike'] == pos.strike) &
+                (options_snapshot['expiration'] == pos.expiry) &
+                (options_snapshot['call_put'] == pos.option_type)
+            ]
+            
+            # Skip if option not found in today's market data
+            if len(option_match) == 0:
+                continue
+            
+            market_price = option_match.iloc[0]['mid_price']
+            
+            # Calculate time to expiry
+            T = max(0, (pos.expiry - current_date).days / 365.0)
+            
+            # Skip very near expiry options (let them expire naturally) ---------------------------------------------------------------------------
+            if T < 0.01:  # Less than ~4 days
+                continue
+            
+            # Calculate current theoretical price
+            theo_price, sigma = self.calculate_theo_price(
+                S=underlying_price,
+                K=pos.strike,
+                T=T,
+                r=risk_free_rate,
+                option_type=pos.option_type,
+                current_date=current_date
+            )
+            
+            # Calculate current mispricing
+            if theo_price > 0:
+                current_mispricing = abs((market_price - theo_price) / theo_price)
+            else:
+                print("Warning! Negative theoretical calculated, check pipeline!")
+                continue 
+            
+            # Check if mispricing has converged to fair value
+            if current_mispricing < self.exit_threshold:
+                # Calculate delta for hedge unwinding
+                opt_delta = delta(underlying_price, pos.strike, T, risk_free_rate, sigma, pos.option_type)
+                
+                # Create closing trade for option (opposite of current position)
+                closing_qty = -pos.quantity  # Negative to close
+                
+                option_close_trade = Trade(
+                    symbol=pos.symbol,
+                    quantity=closing_qty,
+                    price=market_price,
+                    trade_type='option',
+                    timestamp=current_date,
+                    strike=pos.strike,
+                    expiry=pos.expiry,
+                    option_type=pos.option_type,
+                    implied_vol=sigma,
+                    delta=opt_delta
+                )
+                closing_trades.append(option_close_trade)
+                
+                # Create closing trade for delta hedge
+                hedge_unwind_qty = opt_delta * 100 * pos.quantity
+                
+                hedge_close_trade = Trade(
+                    symbol=pos.symbol,
+                    quantity=hedge_unwind_qty,
+                    price=underlying_price,
+                    trade_type='stock',
+                    timestamp=current_date,
+                    strike=None,
+                    expiry=None,
+                    option_type=None
+                )
+                closing_trades.append(hedge_close_trade)
+        
+        return closing_trades
 
     def generate_signals(self, 
                         portfolio, 
@@ -377,7 +523,7 @@ class MispricingStrategy():
         df['T'] = df['days_to_expiry'] / 365
         
         # Vectorized volatility calculation
-        df['sigma'] = self._vectorized_get_volatilities(df, underlying_price, current_date)
+        df['sigma'] = self._vectorized_get_volatilities(df, current_date)
         
         # Handle near-expiration cases (vectorized)
         near_expiry_mask = df['T'] < 1e-6
@@ -442,8 +588,9 @@ class MispricingStrategy():
         
         # Track running capital usage as we generate signals
         # This prevents over-allocation when multiple signals are generated in one batch
-        capital_used, current_equity = self.calculate_capital_usage(portfolio)
+        capital_used, short_exposure, current_equity = self.calculate_capital_usage(portfolio)
         running_capital_used = capital_used
+        running_short_exposure = short_exposure
         
         # Create TradeSignal objects with dynamic position sizing
         for _, row in df_mispriced.iterrows():
@@ -453,15 +600,11 @@ class MispricingStrategy():
             strike = row['strike']
             
             # Calculate capital required for this trade
-            if action == 'buy':
-                option_capital = option_price * 100
-            else:
-                # Short option margin
-                option_capital = strike * 100 * 0.20 + option_price * 100
+            option_capital = option_price * 100
             
-            # Hedge capital (50% margin for stock)
+            # Hedge capital (full value)
             hedge_shares = abs(opt_delta) * 100
-            hedge_capital = hedge_shares * underlying_price * 0.5
+            hedge_capital = hedge_shares * underlying_price
             
             capital_per_contract = option_capital + hedge_capital
             
@@ -470,6 +613,10 @@ class MispricingStrategy():
             available_capital = max(0, max_capital - running_capital_used)
             max_position_capital = current_equity * self.max_position_pct
             
+            # Check short exposure capacity
+            max_short_capital = current_equity * self.max_short_exposure
+            available_short_capacity = max(0, max_short_capital - running_short_exposure)
+            
             if capital_per_contract > 0:
                 max_contracts_total = int(available_capital / capital_per_contract)
                 max_contracts_position = int(max_position_capital / option_capital) if option_capital > 0 else self.contracts_per_trade
@@ -477,7 +624,16 @@ class MispricingStrategy():
                 max_contracts_total = self.contracts_per_trade
                 max_contracts_position = self.contracts_per_trade
             
-            contracts = min(self.contracts_per_trade, max_contracts_total, max_contracts_position)
+            # For short positions, check short exposure limit
+            if action == 'sell':
+                if option_capital > 0:
+                    max_contracts_short = int(available_short_capacity / option_capital)
+                else:
+                    max_contracts_short = self.contracts_per_trade
+            else:
+                max_contracts_short = self.contracts_per_trade
+            
+            contracts = min(self.contracts_per_trade, max_contracts_total, max_contracts_position, max_contracts_short)
             
             # Skip if we can't take any contracts due to capital limits
             if contracts <= 0:
@@ -485,6 +641,10 @@ class MispricingStrategy():
             
             # Update running capital usage for next iteration
             running_capital_used += contracts * capital_per_contract
+            
+            # Update running short exposure for short positions
+            if action == 'sell':
+                running_short_exposure += contracts * option_capital
             
             # Apply direction (buy = positive, sell = negative)
             contract_qty = contracts if action == 'buy' else -contracts
@@ -528,33 +688,9 @@ class MispricingStrategy():
                 - 'stock': Create delta hedge trade
                 
         Returns:
-            Trade object ready for portfolio.execute_trade()\
-        
-        Structure:
-            if trade_type == 'option':
-                - symbol = signal.symbol (e.g., 'SPY')
-                - quantity = signal.quantity (positive for buy, negative for sell)
-                  * If action='buy': quantity = +self.contracts_per_trade
-                  * If action='sell': quantity = -self.contracts_per_trade
-                - price = signal.market_price
-                - Include option metadata: strike, expiry, option_type
-                
-            elif trade_type == 'stock':
-                - symbol = signal.symbol (e.g., 'SPY')
-                - quantity = signal.hedge_quantity (calculated from delta)
-                - price = signal.underlying_price
-                - No option metadata (set to None)
-                
-        Hints:
-            - Trade dataclass from engine.py requires:
-              Trade(symbol, quantity, price, trade_type, timestamp,
-                    strike=None, expiry=None, option_type=None)
-            - Hedge quantity is OPPOSITE of option delta exposure
-              * Long call (+delta) → Short stock (negative quantity)
-              * Short call (-delta) → Long stock (positive quantity)
-            - Use signal.timestamp for trade timestamp
-
+            Trade object ready for portfolio.execute_trade()
         """
+
         if trade_type == 'option':
             # Create option trade
             trade = Trade(
@@ -566,7 +702,8 @@ class MispricingStrategy():
                 strike=signal.strike,
                 expiry=signal.expiry,
                 option_type=signal.option_type,
-                implied_vol=signal.implied_vol
+                implied_vol=signal.implied_vol,
+                delta=signal.delta
             )
             
         elif trade_type == 'stock':
@@ -581,8 +718,6 @@ class MispricingStrategy():
                 expiry=None,
                 option_type=None
             )
-        else:
-            raise ValueError(f"Unknown trade_type: {trade_type}")
         
         return trade
 
