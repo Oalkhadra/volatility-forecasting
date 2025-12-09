@@ -30,18 +30,18 @@ CONFIG = {
     # Backtest parameters
     'start_date': datetime(2023 ,12, 4),
     'end_date': datetime(2024, 12, 4),
-    'initial_capital': 200000.0,
+    'initial_capital': 500000.0,
     
     # Strategy parameters
-    'mispricing_threshold': 0.25,  # 25% mispricing required to enter
-    'exit_threshold': 0.25,        # 25% mispricing to exit early (0 = hold to expiry)
-    'max_positions': 19,
-    'contracts_per_trade': 5,     # Max contracts per trade (will be reduced if needed)
+    'mispricing_threshold': 0.35,  # 30% mispricing required to enter
+    'exit_threshold': 0.25,        # 20% mispricing to exit early (0 = hold to expiry)
+    'max_positions': 21,
+    'contracts_per_trade': 2,     # Max contracts per trade (will be reduced if needed)
     
     # Risk management parameters
     'max_leverage': 1,            # Max total capital usage / equity ratio
     'max_position_pct': 0.50,     # Max single position as % of equity
-    'max_short_exposure': 0.35,   # Can only hold short positions worth 35% of total equity 
+    'max_short_exposure': 0.4,   # Max margin requirement for short positions (20% of notional) as % of equity 
      
     # Model parameters
     'ml_horizon': 7,
@@ -63,7 +63,7 @@ CONFIG = {
 
 def run_single_backtest(model_name: str, 
                        vol_model,
-                       risk_premium: float = 0.0) -> Tuple[pd.DataFrame, BacktestEngine]:
+                       risk_premium: float = 0.1) -> Tuple[pd.DataFrame, BacktestEngine]:
     """
     Run backtest for a single volatility model.
     
@@ -82,13 +82,7 @@ def run_single_backtest(model_name: str,
         4. Attach strategy to engine
         5. Run backtest
         6. Return results
-        
-    Hints:
-        - Use CONFIG dict for parameters
-        - Print progress messages
-        - Handle errors gracefully
-        - For ML/GARCH: Pass returns_data to strategy
-        - For Historical: Pass prices_data to strategy
+
     """
     print(f"\n{'='*60}")
     print(f"Running backtest: {model_name}")
@@ -193,6 +187,30 @@ def run_all_backtests() -> Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.Data
     
     # Save trade log
     trade_log_path = os.path.join(trade_logs_dir, 'GARCH_trade_log.csv')
+    trade_log.to_csv(trade_log_path, index=False)
+    print(f"  Saved trade log to: {trade_log_path}")
+
+
+    # ML model - Pre-train on historical data before backtest period
+    print("\nPre-training XGBoost model...")
+    prices_df = pd.read_parquet(CONFIG['prices_path'])
+    prices_df['date'] = pd.to_datetime(prices_df['date'])
+    
+    # Calculate log returns if not present
+    if 'log_ret' not in prices_df.columns:
+        prices_df['log_ret'] = np.log(prices_df['close'] / prices_df['close'].shift(1)) * 100
+    
+    xgb_model = MLForecaster(pretrained=True)
+    xgb_model.pretrain(prices_df, cutoff_date=CONFIG['start_date'])
+    
+    results_df, engine, trade_log = run_single_backtest('XGB', xgb_model)
+
+    # Get expiry log from engine
+    expiry_log = pd.DataFrame(engine.portfolio.expiry_log) if engine.portfolio.expiry_log else pd.DataFrame()
+    results['XGB'] = (results_df, engine, expiry_log)
+    
+    # Save trade log
+    trade_log_path = os.path.join(trade_logs_dir, 'XGB_trade_log.csv')
     trade_log.to_csv(trade_log_path, index=False)
     print(f"  Saved trade log to: {trade_log_path}")
 

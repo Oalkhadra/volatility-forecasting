@@ -15,7 +15,6 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 from arch import arch_model
-from .historical import calculate_realized_volatility
 
 class GARCHForecaster:
     """
@@ -113,14 +112,17 @@ class MLForecaster:
     
     This captures non-linear relationships and interactions that 
     parametric models like GARCH might miss.
+    
+    Supports pre-training on historical data for faster backtesting.
     """
     
-    def __init__(self, horizon: int = 7):
+    def __init__(self, pretrained: bool = False):
         """
         Initialize ML forecaster.
         
         Args:
-            horizon: Forecast horizon in days (default 7 for weekly)
+            pretrained: If True, model expects to be pretrained before backtest.
+                       This skips daily retraining in update_vol_model().
         """
         self.model = xgb.XGBRegressor(
             n_estimators=300,
@@ -132,12 +134,13 @@ class MLForecaster:
             objective='reg:squarederror'
         )
         
-        self.horizon = horizon
         self.is_fitted = False
+        self.pretrained = pretrained  # Skip daily retraining if True
         self.feature_names = []
         self.scaler = None  # For feature scaling if needed
+        self._last_returns = None  # Store returns for forecasting
         
-    def _create_features(self, returns: pd.Series, lookback: int = 30) -> np.ndarray:
+    def _create_features(self, returns: pd.Series, lookback = 30, horizon = None) -> np.ndarray:
         """
         Create feature matrix from returns.
         
@@ -149,27 +152,11 @@ class MLForecaster:
         5. GARCH forecast (optional - as a feature)
         
         Args:
-            returns: Return series
+            returns: Return series (log returns, already computed)
             lookback: How far back to look for features
             
         Returns:
             Feature array [rv_5d, rv_10d, rv_20d, rv_30d, ret_1d, ...]
-            
-        TODO: Implement feature engineering
-        
-        Hints:
-            1. Calculate multiple rolling vols (different windows)
-            2. Calculate recent cumulative returns
-            3. Calculate rolling skew and kurtosis
-            4. Make sure all features use ONLY past data (no leakage!)
-            5. Handle NaNs (first few observations)
-            
-        Interview Question: "What features did you use for vol forecasting?"
-            I used lagged realized volatilities at multiple horizons (5, 10, 20, 30 days)
-            to capture short and long-term patterns. Recent returns capture momentum
-            effects. Higher moments like skewness indicate tail risk, which relates
-            to future vol. The multi-scale approach lets the model learn which
-            horizon is most predictive.
         """
         n = len(returns)
         features_list = []
@@ -179,11 +166,13 @@ class MLForecaster:
             # Get returns UP TO time i
             past_returns = returns.iloc[:i]
             
-            # Calculate features using ONLY past data
-            rv_5 = calculate_realized_volatility(past_returns, window=5).iloc[-1]
-            rv_10 = calculate_realized_volatility(past_returns, window=10).iloc[-1]
-            rv_20 = calculate_realized_volatility(past_returns, window=20).iloc[-1]
-            rv_30 = calculate_realized_volatility(past_returns, window=30).iloc[-1]
+            # Calculate realized vol directly from returns (no log transform needed)
+            # Returns are already in percentage scale (log_ret * 100 from engine.py)
+            # So we calculate std and annualize
+            rv_5 = past_returns.iloc[-5:].std() * np.sqrt(252)
+            rv_10 = past_returns.iloc[-10:].std() * np.sqrt(252)
+            rv_20 = past_returns.iloc[-20:].std() * np.sqrt(252)
+            rv_30 = past_returns.iloc[-30:].std() * np.sqrt(252)
             
             # Recent returns
             ret_1d = past_returns.iloc[-1]
@@ -209,9 +198,13 @@ class MLForecaster:
             
             features_list.append(features)
         
+        
         # Convert to DataFrame
         df = pd.DataFrame(features_list)
-        
+
+        # Add horizon as a feature
+        df['horizon'] = horizon
+
         # Store feature names
         self.feature_names = df.columns.tolist()
         
@@ -244,7 +237,7 @@ class MLForecaster:
         
         return target_slice.values
     
-    def fit(self, returns: pd.Series, min_train_size: int = 60) -> None:
+    def fit(self, returns: pd.Series, min_train_size = 30, horizons = [1, 3, 5, 7, 14, 21, 30]) -> None:
         """
         Fit ML model to return series.
         
@@ -266,65 +259,166 @@ class MLForecaster:
         Note: For backtesting, you'll call fit() with expanding window
         each week to ensure no lookahead bias.
         """
+        # If pretrained and already fitted, just update the returns cache
+        if self.pretrained and self.is_fitted:
+            self._last_returns = returns.copy()
+            return
+            
         if len(returns) < min_train_size:
             raise ValueError(f"Need at least {min_train_size} returns to fit ML model")
         
+        # Store returns for forecasting
+        self._last_returns = returns.copy()
+        
         # 1. Create Features and Targets
-        # We use our helper methods. 
-        # Note: _create_targets returns a numpy array aligned with features
-        X = self._create_features(returns, lookback=30)
-        y = self._create_targets(returns, lookback=30, horizon=self.horizon)
-
-        # 2. Align lengths
-        # _create_features usually returns df starting at index 'lookback'
-        # _create_targets (the vectorized one) returns array of length (N - lookback - horizon)
+        all_X, all_y = [], []
+        for h in horizons:
+            X = self._create_features(returns, horizon=h)
+            y = self._create_targets(returns, horizon=h)
+            
+            # Align X and y: targets are shorter because they need forward data
+            # X has (n - lookback) rows, y has (n - lookback - horizon) rows
+            # Trim X from the end to match y
+            n_samples = len(y)
+            if n_samples > 0:
+                X = X.iloc[:n_samples]
+                all_X.append(X)
+                all_y.append(y)
         
-        # We trim X to match y's length (drop the last 'horizon' rows of features
-        # because we don't have a target for them yet!)
-        X_aligned = X.iloc[:len(y)]
+        if len(all_X) == 0:
+            raise ValueError("Not enough data to create training samples")
         
-        # 3. Fit the model
-        self.model.fit(X_aligned, y)
+        X_combined = pd.concat(all_X, ignore_index=True)
+        y_combined = np.concatenate(all_y)
+        
+        # Remove rows with NaN values
+        mask = ~(X_combined.isna().any(axis=1) | np.isnan(y_combined))
+        X_combined = X_combined[mask]
+        y_combined = y_combined[mask]
+        
+        if len(X_combined) == 0:
+            raise ValueError("All training samples contain NaN values")
+        
+        self.model.fit(X_combined, y_combined)
         self.is_fitted = True
         
         # Save feature names for later importance plotting
-        self.feature_names = X.columns.tolist()
+        self.feature_names = X_combined.columns.tolist()
+        
+        print(f"  MLForecaster trained on {len(X_combined)} samples across {len(horizons)} horizons")
+    
+    def pretrain(self, prices_df: pd.DataFrame, cutoff_date, horizons = [1, 3, 5, 7, 14, 21, 30]) -> None:
+        """
+        Pre-train the model on historical data before a cutoff date.
+        
+        This avoids look-ahead bias by only using data before the backtest starts.
+        After pretraining, daily calls to fit() will only update the returns cache
+        for forecasting, not retrain the model.
+        
+        Args:
+            prices_df: DataFrame with 'date' and 'log_ret' columns
+            cutoff_date: Train only on data before this date (typically backtest start)
+            horizons: List of forecast horizons to train on
+        """
+        print(f"Pre-training MLForecaster on data before {cutoff_date}...")
+        
+        # Filter to data before cutoff
+        prices_df = prices_df.copy()
+        prices_df['date'] = pd.to_datetime(prices_df['date'])
+        historical = prices_df[prices_df['date'] < cutoff_date]
+        
+        if len(historical) < 100:
+            raise ValueError(f"Not enough historical data for pre-training. Have {len(historical)}, need at least 100")
+        
+        returns = historical['log_ret'].dropna()
+        print(f"  Training on {len(returns)} historical returns")
+        
+        # Mark as pretrained so future fit() calls just update returns cache
+        self.pretrained = True
+        self.is_fitted = False  # Temporarily unset so fit() actually trains
+        
+        # Train the model
+        self.fit(returns, horizons=horizons)
+        
+        # Now mark as pretrained
+        self.pretrained = True
+        print(f"  Pre-training complete!")
 
-    def forecast(self, returns: pd.Series) -> float:
+    def _create_current_features(self, returns: pd.Series, horizon: int = 7) -> pd.DataFrame:
+        """
+        Create features for ONLY the most recent timestamp (optimized for forecasting).
+        
+        This is much faster than _create_features() which loops through all history.
+        
+        Args:
+            returns: Return series (needs at least 30 values)
+            horizon: Forecast horizon
+            
+        Returns:
+            Single-row DataFrame with features for the current time point
+        """
+        if len(returns) < 30:
+            raise ValueError("Need at least 30 returns to create features")
+        
+        # Calculate realized vol directly from recent returns
+        rv_5 = returns.iloc[-5:].std() * np.sqrt(252)
+        rv_10 = returns.iloc[-10:].std() * np.sqrt(252)
+        rv_20 = returns.iloc[-20:].std() * np.sqrt(252)
+        rv_30 = returns.iloc[-30:].std() * np.sqrt(252)
+        
+        # Recent returns
+        ret_1d = returns.iloc[-1]
+        ret_5d = returns.iloc[-5:].sum()
+        ret_10d = returns.iloc[-10:].sum()
+        
+        # Higher moments (last 30 days)
+        skew_30 = returns.iloc[-30:].skew()
+        kurt_30 = returns.iloc[-30:].kurtosis()
+        
+        # Build feature dict
+        features = {
+            'rv_5d': rv_5,
+            'rv_10d': rv_10,
+            'rv_20d': rv_20,
+            'rv_30d': rv_30,
+            'ret_1d': ret_1d,
+            'ret_5d': ret_5d,
+            'ret_10d': ret_10d,
+            'skew_30d': skew_30,
+            'kurt_30d': kurt_30,
+            'horizon': horizon,
+        }
+        
+        return pd.DataFrame([features])
+
+    def forecast(self, returns: pd.Series = None, horizon = 7) -> float:
         """
         Generate volatility forecast using most recent data.
         
         Args:
-            returns: Historical returns (to create features from)
+            returns: Historical returns (to create features from).
+                    If None, uses cached returns from last fit() call.
             
         Returns:
-            Forecasted annualized volatility for next 'horizon' days
-            
-        TODO: Implement ML prediction
-        
-        Hints:
-            1. Check if model is fitted
-            2. Create features from most recent returns
-            3. Use self.model.predict() to generate forecast
-            4. Return annualized vol
+            Forecasted annualized volatility for next 'horizon' days (decimal, e.g., 0.15 for 15%)
+
         """
         if not self.is_fitted:
             raise ValueError("Must call fit() before forecast()")
         
-        # Create features for the most recent timestamp
-        # We calculate features for the entire series and take the last row
-        # In production, this would be optimized to only calc the last row
-        all_features = self._create_features(returns, lookback=30)
+        # Use provided returns or fall back to cached returns
+        if returns is None:
+            if self._last_returns is None:
+                raise ValueError("No returns provided and no cached returns available")
+            returns = self._last_returns
         
-        if len(all_features) == 0:
-            raise ValueError("Not enough data to generate forecast features")
-            
-        current_features = all_features.iloc[-1:] # Keep as DataFrame to preserve names
+        # Create features for ONLY the current timestamp (fast!)
+        current_features = self._create_current_features(returns, horizon=horizon)
         
         # Predict
         prediction = self.model.predict(current_features)[0]
         
-        return float(prediction)
+        return float(prediction) / 100 # Convert Vol estimate to decimal
     
     def get_feature_importance(self) -> pd.DataFrame:
         """
@@ -332,9 +426,6 @@ class MLForecaster:
         
         Returns:
             DataFrame with features and their importance scores
-            
-        TODO: OPTIONAL - For analysis phase
-        This is useful for understanding what drives vol predictions.
         """
         if not self.is_fitted:
             raise ValueError("Must call fit() first")
@@ -349,33 +440,6 @@ class MLForecaster:
 
 
 # Comparison and helper functions
-
-def compare_forecasters(
-    returns: pd.Series,
-    realized_vols: pd.Series,
-    train_size: int = 60
-) -> pd.DataFrame:
-    """
-    Compare GARCH vs ML forecast accuracy.
-    
-    Args:
-        returns: Return series
-        realized_vols: Actual realized volatilities (to compare against)
-        train_size: Minimum training window size
-        
-    Returns:
-        DataFrame comparing forecast accuracy metrics:
-            - RMSE: Root mean squared error
-            - MAE: Mean absolute error
-            - Correlation: Forecast vs realized
-            - Hit rate: % of times forecast > realized when actual > avg
-        
-    TODO: OPTIONAL - For Phase 5 analysis
-    This generates performance comparison of GARCH vs ML.
-    Useful for understanding which forecasting method works better.
-    """
-    pass
-
 
 def calculate_forecast_accuracy(
     forecasts: pd.Series,
@@ -415,101 +479,3 @@ def calculate_forecast_accuracy(
         'Hit_Rate': hit_rate,
         'N_Observations': len(a)
     }
-
-
-if __name__ == "__main__":
-    # Test your implementation
-    print("="*60)
-    print("VOLATILITY FORECASTING TEST")
-    print("="*60)
-    
-    # Load price data and calculate returns
-    try:
-        prices_df = pd.read_parquet('././data/processed/spy_prices.parquet')
-        prices = prices_df['close']
-        returns = np.log(prices / prices.shift(1)).dropna()
-        
-        print(f"Loaded {len(returns)} returns")
-        print(f"Return stats:")
-        print(f"  Mean: {returns.mean():.4f}")
-        print(f"  Std: {returns.std():.4f}")
-        print(f"  Annualized vol: {returns.std() * np.sqrt(252):.2%}")
-        
-        # Test GARCH
-        print("\n" + "-"*60)
-        print("GARCH(1,1) Forecaster - Classical Econometric")
-        print("-"*60)
-        garch = GARCHForecaster()
-        garch.fit(returns)
-        
-        if garch.is_fitted:
-            forecast_vol = garch.forecast(horizon=7)
-            print(f"✓ GARCH fitted successfully!")
-            print(f"  Parameters: ω={garch.omega:.6f}, α={garch.alpha:.4f}, β={garch.beta:.4f}")
-            print(f"  Persistence (α+β): {garch.alpha + garch.beta:.4f}")
-            print(f"  Long-run vol: {np.sqrt((garch.omega/(1-garch.alpha-garch.beta))*252):.2%}")
-            print(f"  7-day forecast: {forecast_vol:.2%}")
-        else:
-            print("❌ GARCH not implemented yet")
-        
-        # Test ML
-        print("\n" + "-"*60)
-        print("XGBoost ML Forecaster - Modern Machine Learning")
-        print("-"*60)
-        
-        # Use first 80% for training, last 20% for testing
-        train_size = int(len(returns) * 0.8)
-        train_returns = returns.iloc[:train_size]
-        test_returns = returns  # Use all for forecast
-        
-        ml = MLForecaster(horizon=7)
-        ml.fit(train_returns)
-        
-        if ml.is_fitted:
-            forecast_vol = ml.forecast(test_returns)
-            print(f"✓ ML model fitted successfully!")
-            print(f"  Training size: {len(train_returns)} days")
-            print(f"  Number of features: {len(ml.feature_names)}")
-            print(f"  7-day forecast: {forecast_vol:.2%}")
-            
-            # Show feature importance
-            try:
-                importance = ml.get_feature_importance()
-                print(f"\n  Top 3 Important Features:")
-                for i, row in importance.head(3).iterrows():
-                    print(f"    {row['feature']}: {row['importance']:.4f}")
-            except:
-                pass
-        else:
-            print("❌ ML model not implemented yet")
-        
-        # Comparison
-        if garch.is_fitted and ml.is_fitted:
-            # Get fresh forecasts
-            garch_fc = garch.forecast(horizon=7)
-            ml_fc = ml.forecast(test_returns)
-            
-            # Calculate actual realized volatility for the next 7 days
-            # We need the data following the test period to calculate "actual"
-            # Note: In a real backtest, we wouldn't know this yet!
-            # We take the last 7 days of the loaded data if available, or say "Unknown"
-            # But here 'test_returns' IS the full dataset, so we can't calculate "next" 7 days
-            # unless we held out data. 
-            
-            # Let's calculate the realized vol of the LAST 7 days to compare 
-            # with what a forecast made 7 days ago WOULD have predicted (just for context)
-            last_7d_realized = returns.iloc[-7:].std() * np.sqrt(252)
-            
-            print("\n" + "="*60)
-            print("FORECAST SNAPSHOT (Annualized)")
-            print("="*60)
-            print(f"  GARCH forecast (Next 7d):     {garch_fc:.2%}")
-            print(f"  ML forecast (Next 7d):        {ml_fc:.2%}")
-            print(f"  Realized Vol (Last 7d):       {last_7d_realized:.2%} (for context)")
-            
-            print(f"\n  Both methods ready for backtesting!")
-            print("="*60)
-            
-    except Exception as e:
-        print(f"Error: {e}")
-        print("Make sure spy_prices.parquet exists")

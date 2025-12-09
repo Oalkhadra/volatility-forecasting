@@ -157,12 +157,24 @@ def process_raw_options(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
 # YFINANCE FUNCTIONS
 # =============================================================================
 
-def get_underlying_prices(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """Download underlying price data from Yahoo Finance."""
+def get_underlying_prices(ticker: str, start_date: str, end_date: str, full_history: bool = False) -> pd.DataFrame:
+    """Download underlying price data from Yahoo Finance.
+    
+    Args:
+        ticker: Stock ticker symbol
+        start_date: Start date for price data
+        end_date: End date for price data  
+        full_history: If True, download all available history (for ML pre-training)
+    """
     print(f"  Downloading {ticker} prices...")
     
     # Add buffer days for yfinance
-    start_dt = datetime.strptime(start_date, '%Y-%m-%d') - timedelta(days=5)
+    if full_history:
+        # Get all available history for ML model pre-training
+        start_dt = datetime(2010, 1, 1)  # Go back to 2010 for full history
+        print(f"    Loading FULL history from {start_dt.strftime('%Y-%m-%d')}")
+    else:
+        start_dt = datetime.strptime(start_date, '%Y-%m-%d') - timedelta(days=5)
     end_dt = datetime.strptime(end_date, '%Y-%m-%d') + timedelta(days=5)
     
     df = yf.download(ticker, start=start_dt, end=end_dt, progress=False, auto_adjust=False)
@@ -368,9 +380,9 @@ def download_and_process(
     print(f"\n2. Processing raw data...")
     df = process_raw_options(raw_df, symbol)
     
-    # 3. Get underlying prices
+    # 3. Get underlying prices (full history for ML pre-training)
     print(f"\n3. Fetching underlying prices...")
-    prices_df = get_underlying_prices(symbol, start_date, end_date)
+    prices_df = get_underlying_prices(symbol, start_date, end_date, full_history=True)
     
     # 4. Get risk-free rate
     print(f"\n4. Fetching risk-free rate...")

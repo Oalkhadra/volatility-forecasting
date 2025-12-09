@@ -115,10 +115,10 @@ class Portfolio:
         if apply_costs:
             if trade.trade_type == 'option':
                 # $0.50 per contract
-                transaction_cost = abs(trade.quantity) * 0.05
+                transaction_cost = abs(trade.quantity) * 0.25
             else:  # stock
                 # 10 bips (0.1%)
-                transaction_cost = abs(trade.quantity * trade.price) * 0.0005
+                transaction_cost = abs(trade.quantity * trade.price) * 0.001
         
         # Update cash (buying = negative, selling = positive)
         self.cash -= (base_cost + transaction_cost)
@@ -368,7 +368,7 @@ class BacktestEngine:
 
         # Filter data to backtest date range
         options_df = options_df[(options_df['date'] <= self.end_date) & (options_df['date'] >= self.start_date)]
-        prices_df = prices_df[(prices_df['date'] <= self.end_date) & (prices_df['date'] >= self.start_date)]
+        prices_df = prices_df[(prices_df['date'] <= self.end_date)]
         rfr_df = rfr_df[(rfr_df['date'] <= self.end_date) & (rfr_df['date'] >= self.start_date)]
 
         # Calculate returns column for prices
@@ -507,7 +507,7 @@ class BacktestEngine:
         print("Starting backtest...")
         
         # Get all days with option data
-        trading_days = self.get_trading_days()[5:] # Add 5 trade day buffer for backwards modeling approaches
+        trading_days = self.get_trading_days()[30:] # Add 30 day buffer for rolling modeling approaches
        
         print(f"Trading days: {len(trading_days)}")
         print(f"First: {trading_days[0]}, Last: {trading_days[-1]}")
