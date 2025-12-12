@@ -53,7 +53,7 @@ class GARCHForecaster:
         Estimates parameters ω, α, β by maximum likelihood.
 
         """
-        model = arch_model(returns, vol='GARCH', p=1, q=1)
+        model = arch_model(returns, vol='GARCH', p=1, q=1, dist='t')
         result = model.fit(disp='off')
 
         self.omega = result.params['omega']
@@ -146,10 +146,6 @@ class MLForecaster:
         
         Features:
         1. Lagged realized vols (5d, 10d, 20d, 30d)
-        2. Recent returns (1d, 5d, 10d)
-        3. Higher moments (30d skew, kurtosis)
-        4. Return autocorrelation
-        5. GARCH forecast (optional - as a feature)
         
         Args:
             returns: Return series (log returns, already computed)
@@ -307,7 +303,7 @@ class MLForecaster:
         
         print(f"  MLForecaster trained on {len(X_combined)} samples across {len(horizons)} horizons")
     
-    def pretrain(self, prices_df: pd.DataFrame, cutoff_date, horizons = [1, 3, 5, 7, 14, 21, 30]) -> None:
+    def pretrain(self, prices_df: pd.DataFrame, cutoff_date, horizons = [1, 3, 5, 7, 14, 21, 30, 40, 50, 60, 80, 100, 120]) -> None:
         """
         Pre-train the model on historical data before a cutoff date.
         

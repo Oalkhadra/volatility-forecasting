@@ -18,6 +18,8 @@ from dateutil.relativedelta import relativedelta
 import sys
 import os
 from tqdm import tqdm
+import glob
+
 
 # Add parent directory to path for absolute imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -77,7 +79,8 @@ class Trade:
     expiry: Optional[datetime] = None
     option_type: Optional[str] = None
     implied_vol: Optional[float] = None  # Store IV for daily rebalancing
-    delta: Optional[float] = None # Store calculated delta for trade log validations
+    delta: Optional[float] = None  # Store calculated delta for trade log validations
+    mispricing_pct: Optional[float] = None  # Actual mispricing % at entry
     
     def get_key(self) -> str:
         """Get unique position key for this trade."""
@@ -115,10 +118,10 @@ class Portfolio:
         if apply_costs:
             if trade.trade_type == 'option':
                 # $0.50 per contract
-                transaction_cost = abs(trade.quantity) * 0.25
+                transaction_cost = abs(trade.quantity) * 0.5
             else:  # stock
-                # 10 bips (0.1%)
-                transaction_cost = abs(trade.quantity * trade.price) * 0.001
+                # 5 bips (0.05%)
+                transaction_cost = abs(trade.quantity * trade.price) * 0.0005
         
         # Update cash (buying = negative, selling = positive)
         self.cash -= (base_cost + transaction_cost)
@@ -254,7 +257,8 @@ class Portfolio:
             'underlying_price': underlying_price
         })
     
-    def log_early_exit(self, date: datetime, pos_key: str, exit_price: float, quantity: float):
+    def log_early_exit(self, date: datetime, pos_key: str, exit_price: float, 
+                       quantity: float, entry_price: float = None):
         """
         Log early exit event for analysis.
         
@@ -263,13 +267,25 @@ class Portfolio:
             pos_key: Position key that was closed
             exit_price: Price at which position was closed
             quantity: Quantity closed (negative of original position)
+            entry_price: Original entry price (for P&L calculation)
         """
+        # Calculate P&L if entry price provided
+        # For options: (exit_price - entry_price) * quantity * 100
+        # quantity is negative for closing longs, positive for closing shorts
+        pnl = None
+        if entry_price is not None:
+            # Closing a long (quantity < 0): profit if exit > entry
+            # Closing a short (quantity > 0): profit if exit < entry
+            pnl = (exit_price - entry_price) * quantity * 100
+        
         self.early_exit_log.append({
             'date': date,
             'event': 'early_exit',
             'position_key': pos_key,
+            'entry_price': entry_price,
             'exit_price': exit_price,
-            'quantity': quantity
+            'quantity': quantity,
+            'pnl': pnl
         })
     
     def get_portfolio_delta(self, S: float, r: float, current_date: datetime) -> float:
@@ -347,13 +363,24 @@ class BacktestEngine:
         self.prices_data = None
         self.rates_data = None
         
-    def load_data(self, options_path: str, prices_path: str, rates_path: str):
+    def load_data(self, options_dir: str, prices_path: str, rates_path: str):
         """
         Load market data and filter to backtest date range.
         Note: Keeps historical price data before start_date for rolling calculations.
-        """
-        # Read data, already sorted and filtered by date when stored through preprocess.py
-        options_df = pd.read_parquet(options_path)        
+        
+        Args:
+            options_dir: Directory containing spy_options_YYYY_MM.parquet files
+            prices_path: Path to prices parquet file
+            rates_path: Path to risk-free rate parquet file
+        """       
+        # Load all monthly options files
+        options_files = sorted(glob.glob(f'{options_dir}/spy_options_*.parquet'))
+        if not options_files:
+            raise FileNotFoundError(f"No spy_options_*.parquet files found in {options_dir}")
+        
+        print(f"  Loading {len(options_files)} monthly options files...")
+        options_df = pd.concat([pd.read_parquet(f) for f in options_files], ignore_index=True)
+        
         prices_df = pd.read_parquet(prices_path)
         rfr_df = pd.read_parquet(rates_path)
         
@@ -370,6 +397,9 @@ class BacktestEngine:
         options_df = options_df[(options_df['date'] <= self.end_date) & (options_df['date'] >= self.start_date)]
         prices_df = prices_df[(prices_df['date'] <= self.end_date)]
         rfr_df = rfr_df[(rfr_df['date'] <= self.end_date) & (rfr_df['date'] >= self.start_date)]
+        
+        # Print records size after backtest range filter
+        print(f"  Loaded {len(options_df):,} total option records")
 
         # Calculate returns column for prices
         prices_df['log_ret'] = np.log(prices_df['close'] / prices_df['close'].shift(1)) * 100
@@ -534,15 +564,22 @@ class BacktestEngine:
             
             # Execute early exit trades
             for trade in early_exit_trades:
+                # Get entry price before executing trade (position still exists)
+                pos_key = trade.get_key()
+                entry_price = None
+                if pos_key in self.portfolio.positions:
+                    entry_price = self.portfolio.positions[pos_key].entry_price
+                
                 self.portfolio.execute_trade(trade)
                 
                 # Log early exit event for analysis
                 if trade.trade_type == 'option':
                     self.portfolio.log_early_exit(
                         date=current_date,
-                        pos_key=trade.get_key(),
+                        pos_key=pos_key,
                         exit_price=trade.price,
-                        quantity=trade.quantity
+                        quantity=trade.quantity,
+                        entry_price=entry_price
                     )
             
             # Rebalance delta after expiries and early exits

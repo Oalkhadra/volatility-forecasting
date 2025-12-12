@@ -15,6 +15,7 @@ from backtest.engine import BacktestEngine
 from backtest.strategy import MispricingStrategy
 from volatility.forecasting import GARCHForecaster, MLForecaster
 from volatility.historical import RollingVolCalculator
+from volatility.vrp import VarianceRiskPremiumCalculator
 
 # ============================================================================
 # CONFIGURATION
@@ -22,19 +23,21 @@ from volatility.historical import RollingVolCalculator
 
 CONFIG = {
     # Data paths
-    'options_path': 'data/processed/spy_options.parquet',
+    'options_dir': 'data/processed',  # Directory containing spy_options_YYYY_MM.parquet files
     'prices_path': 'data/processed/spy_prices.parquet',
     'rates_path': 'data/processed/risk_free_rate.parquet',
     'vix_path': 'data/processed/vix_data.parquet',
     
     # Backtest parameters
-    'start_date': datetime(2023 ,12, 4),
-    'end_date': datetime(2024, 12, 4),
+    'start_date': datetime(2020 , 1, 1),
+    'end_date': datetime(2025, 11, 30),
     'initial_capital': 500000.0,
     
-    # Strategy parameters
-    'mispricing_threshold': 0.35,  # 30% mispricing required to enter
-    'exit_threshold': 0.25,        # 20% mispricing to exit early (0 = hold to expiry)
+    # Strategy parameters - asymmetric thresholds
+    'buy_threshold': 0.50,         # 50% underpriced to buy (mispricing < -50%)
+    'sell_threshold': 1.0,        # 80% overpriced to sell (mispricing > +100%)
+    'exit_threshold_buy': 0.25,    # Exit long if mispricing rises above -50% (fair value range)
+    'exit_threshold_sell': 0.50,   # Exit short if mispricing falls below +100% (fair value range)
     'max_positions': 21,
     'contracts_per_trade': 2,     # Max contracts per trade (will be reduced if needed)
     
@@ -44,12 +47,17 @@ CONFIG = {
     'max_short_exposure': 0.4,   # Max margin requirement for short positions (20% of notional) as % of equity 
      
     # Model parameters
-    'ml_horizon': 7,
-    'historical_window': 30,  # 20-day rolling window
+    'historical_window': 30,  # 30-day rolling window
     
-    # Variance risk premium adjustments (IV > RV on average)
-    'risk_premium_garch': 0.15,
-    'risk_premium_historical': 0.15,
+    # Variance Risk Premium (VRP) parameters
+    'use_vrp_calculator': True,   # Use empirical VRP instead of fixed premium
+    'vrp_rv_window': 30,          # Window for realized vol in VRP calculation
+    'vrp_lookback': 252,          # Lookback for rolling VRP average (1 year)
+    'vrp_method': 'regime',      # VRP method: 'rolling', 'regime', or 'regime_rolling'
+    'vrp_use_regime': True,       # Estimate separate VRP by regime
+    
+    # Legacy: Fixed risk premium (only used if use_vrp_calculator=False)
+    'risk_premium_fallback': 0.1,
     
     # Output
     'results_dir': 'results',
@@ -63,22 +71,24 @@ CONFIG = {
 
 def run_single_backtest(model_name: str, 
                        vol_model,
-                       risk_premium: float = 0.1) -> Tuple[pd.DataFrame, BacktestEngine]:
+                       vrp_calculator: VarianceRiskPremiumCalculator = None,
+                       risk_premium: float = 0.0) -> Tuple[pd.DataFrame, BacktestEngine]:
     """
     Run backtest for a single volatility model.
     
     Args:
         model_name: Name of the model (for logging)
         vol_model: Volatility model instance
-        risk_premium: Variance risk premium adjustment (default 0.0)
+        vrp_calculator: VRP calculator for empirical VRP adjustment (preferred)
+        risk_premium: Legacy fixed variance risk premium (used if vrp_calculator is None)
  
     Returns:
-        Tuple of (results_df, engine)
+        Tuple of (results_df, engine, trade_log)
 
     Steps:
         1. Create BacktestEngine instance
         2. Load data (options, prices, rates)
-        3. Create MispricingStrategy with vol_model
+        3. Create MispricingStrategy with vol_model and VRP calculator
         4. Attach strategy to engine
         5. Run backtest
         6. Return results
@@ -96,24 +106,28 @@ def run_single_backtest(model_name: str,
     )
     # 2. Load data
     engine.load_data(
-        options_path=CONFIG['options_path'],
+        options_dir=CONFIG['options_dir'],
         prices_path=CONFIG['prices_path'],
         rates_path=CONFIG['rates_path']
     )
 
-    # 3. Setup strategy
+    # 3. Setup strategy with VRP calculator
     strategy = MispricingStrategy(
         vol_model=vol_model,
         options_data=engine.options_data,
         prices_data=engine.prices_data,
-        threshold=CONFIG['mispricing_threshold'],
-        exit_threshold=CONFIG['exit_threshold'],
+        buy_threshold=CONFIG['buy_threshold'],
+        sell_threshold=CONFIG['sell_threshold'],
+        exit_threshold_buy=CONFIG['exit_threshold_buy'],
+        exit_threshold_sell=CONFIG['exit_threshold_sell'],
         max_positions=CONFIG['max_positions'],
         contracts_per_trade=CONFIG['contracts_per_trade'],
         max_leverage=CONFIG['max_leverage'],
         max_position_pct=CONFIG['max_position_pct'],
         max_short_exposure=CONFIG['max_short_exposure'],
-        risk_premium=risk_premium
+        risk_premium=risk_premium,
+        vrp_calculator=vrp_calculator,
+        vrp_method=CONFIG['vrp_method']
     )
     engine.set_strategy(strategy)
 
@@ -126,50 +140,70 @@ def run_single_backtest(model_name: str,
 
 def run_all_backtests() -> Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.DataFrame]]:
     """
-    Run backtests for all 4 volatility models.
+    Run backtests for all volatility models.
     
     Returns:
         Dictionary mapping model_name -> (results_df, engine, expiry_log)
  
     Steps:
-        1. Load price data and calculate returns
-        2. Setup each of the 4 models
-        3. Run backtest for each model
-        4. Store results in dictionary
-        5. Return results
-        
-    Structure:
-        results = {}
-        
-        # Historical
-        hist_model = setup_historical_model(...)
-        results['Historical'] = run_single_backtest('Historical', hist_model)
-        
-        # Repeat for Surface, GARCH, ML
-        
-        return results
+        1. Load price and VIX data
+        2. Initialize VRP calculator
+        3. Setup each volatility model
+        4. Run backtest for each model
+        5. Store results in dictionary
+        6. Return results
     """
     
     # Create trade logs directory if it doesn't exist
     trade_logs_dir = os.path.join(CONFIG['results_dir'], 'trade_logs')
     os.makedirs(trade_logs_dir, exist_ok=True)
     
+    # Load price and VIX data for VRP calculation
+    print("\nLoading data for VRP calculation...")
+    prices_df = pd.read_parquet(CONFIG['prices_path'])
+    vix_df = pd.read_parquet(CONFIG['vix_path'])
+    prices_df['date'] = pd.to_datetime(prices_df['date'])
+    vix_df['date'] = pd.to_datetime(vix_df['date'])
+    
+    # Calculate log returns if not present
+    if 'log_ret' not in prices_df.columns:
+        prices_df['log_ret'] = np.log(prices_df['close'] / prices_df['close'].shift(1)) * 100
+    
+    # Initialize VRP calculator (if enabled)
+    vrp_calc = None
+    if CONFIG['use_vrp_calculator']:
+        print("\nInitializing Variance Risk Premium calculator...")
+        vrp_calc = VarianceRiskPremiumCalculator(
+            prices_df=prices_df,
+            vix_df=vix_df,
+            rv_window=CONFIG['vrp_rv_window'],
+            vrp_lookback=CONFIG['vrp_lookback'],
+            use_regime=CONFIG['vrp_use_regime']
+        )
+        
+        # Fit on data before backtest start date (no look-ahead bias)
+        vrp_calc.fit(end_date=CONFIG['start_date'])
+        
+        # Print VRP summary
+        print("\nVRP Analysis Summary:")
+        print(vrp_calc.get_analysis_summary().to_string(index=False))
+    
     # Initialize results_dict
     results = {}
 
     ## Run backtest for each modeling approach
-    # Historical (pass prices_data for volatility calculator updates)
-    hist_model = RollingVolCalculator(window=CONFIG['historical_window'],annualize=True)
+    
+    # Historical RV model
+    hist_model = RollingVolCalculator(window=CONFIG['historical_window'], annualize=True)
     results_df, engine, trade_log = run_single_backtest(
         'historical', 
         hist_model,
-        risk_premium=CONFIG['risk_premium_historical']
+        vrp_calculator=vrp_calc,
+        risk_premium=CONFIG['risk_premium_fallback'] if not CONFIG['use_vrp_calculator'] else 0.0
     )
-    # Get expiry log from engine
     expiry_log = pd.DataFrame(engine.portfolio.expiry_log) if engine.portfolio.expiry_log else pd.DataFrame()
     results['historical'] = (results_df, engine, expiry_log)
     
-    # Save trade log
     trade_log_path = os.path.join(trade_logs_dir, 'historical_trade_log.csv')
     trade_log.to_csv(trade_log_path, index=False)
     print(f"  Saved trade log to: {trade_log_path}")
@@ -179,37 +213,30 @@ def run_all_backtests() -> Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.Data
     results_df, engine, trade_log = run_single_backtest(
         'GARCH',
         garch,
-        risk_premium=CONFIG['risk_premium_garch']
+        vrp_calculator=vrp_calc,
+        risk_premium=CONFIG['risk_premium_fallback'] if not CONFIG['use_vrp_calculator'] else 0.0
     )
-    # Get expiry log from engine
     expiry_log = pd.DataFrame(engine.portfolio.expiry_log) if engine.portfolio.expiry_log else pd.DataFrame()
     results['GARCH'] = (results_df, engine, expiry_log)
     
-    # Save trade log
     trade_log_path = os.path.join(trade_logs_dir, 'GARCH_trade_log.csv')
     trade_log.to_csv(trade_log_path, index=False)
     print(f"  Saved trade log to: {trade_log_path}")
 
-
-    # ML model - Pre-train on historical data before backtest period
+    # XGBoost ML model - Pre-train on historical data before backtest period
     print("\nPre-training XGBoost model...")
-    prices_df = pd.read_parquet(CONFIG['prices_path'])
-    prices_df['date'] = pd.to_datetime(prices_df['date'])
-    
-    # Calculate log returns if not present
-    if 'log_ret' not in prices_df.columns:
-        prices_df['log_ret'] = np.log(prices_df['close'] / prices_df['close'].shift(1)) * 100
-    
     xgb_model = MLForecaster(pretrained=True)
     xgb_model.pretrain(prices_df, cutoff_date=CONFIG['start_date'])
     
-    results_df, engine, trade_log = run_single_backtest('XGB', xgb_model)
+    results_df, engine, trade_log = run_single_backtest(
+        'XGB', 
+        xgb_model,
+        vrp_calculator=vrp_calc,
+        risk_premium=CONFIG['risk_premium_fallback'] if not CONFIG['use_vrp_calculator'] else 0.0)
 
-    # Get expiry log from engine
     expiry_log = pd.DataFrame(engine.portfolio.expiry_log) if engine.portfolio.expiry_log else pd.DataFrame()
     results['XGB'] = (results_df, engine, expiry_log)
     
-    # Save trade log
     trade_log_path = os.path.join(trade_logs_dir, 'XGB_trade_log.csv')
     trade_log.to_csv(trade_log_path, index=False)
     print(f"  Saved trade log to: {trade_log_path}")
@@ -375,68 +402,6 @@ def plot_equity_curves(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngine
     
     plt.show()
 
-
-def plot_drawdown_comparison(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.DataFrame]], 
-                            save_path: str = None):
-    """
-    Plot drawdown curves for all models.
-    
-    Args:
-        all_results: Dict mapping model_name -> (results_df, engine, expiry_log)
-        save_path: Path to save figure (optional)
-        
-    TODO: IMPLEMENT THIS (OPTIONAL)
-    
-    Drawdown calculation:
-        - Running maximum of equity curve
-        - Drawdown = (equity - running_max) / running_max
-        - Plot as negative percentage
-    """
-    # TODO: YOUR CODE HERE
-    pass
-
-
-def plot_metrics_bar_chart(metrics_df: pd.DataFrame, 
-                           save_path: str = None):
-    """
-    Create bar chart comparing key metrics.
-    
-    Args:
-        metrics_df: DataFrame from create_metrics_comparison_table()
-        save_path: Path to save figure (optional)
-        
-    TODO: IMPLEMENT THIS (OPTIONAL)
-    
-    Create subplots for:
-        - Sharpe Ratio
-        - Max Drawdown
-        - Total Return
-        - Win Rate
-    """
-    # TODO: YOUR CODE HERE
-    pass
-
-
-def plot_rolling_sharpe(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.DataFrame]],
-                       window: int = 20,
-                       save_path: str = None):
-    """
-    Plot rolling Sharpe ratio over time.
-    
-    Args:
-        all_results: Dict mapping model_name -> (results_df, engine, expiry_log)
-        window: Rolling window for Sharpe calculation
-        save_path: Path to save figure (optional)
-        
-    TODO: IMPLEMENT THIS (OPTIONAL)
-    
-    Shows how strategy performance evolves over time.
-    Useful for identifying regime changes.
-    """
-    # TODO: YOUR CODE HERE
-    pass
-
-
 def plot_iv_comparison(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.DataFrame]],
                       save_path: str = None):
     """
@@ -530,7 +495,6 @@ def plot_iv_comparison(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngine
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
     
     plt.show()
-
 
 # ============================================================================
 # REPORTING
@@ -641,6 +605,62 @@ def save_results_to_csv(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngin
         combined_iv_path = os.path.join(output_dir, 'combined_iv.csv')
         combined_iv_df.to_csv(combined_iv_path, index=False)
         print(f"  Saved combined IV predictions to: {combined_iv_path}")
+        append_vrp_to_combined_iv(combined_iv_path)
+        print(f"Successfully appended VRP values to {combined_iv_path}")
+
+# ============================================================================
+# VRP UTILITIES
+# ============================================================================
+
+def append_vrp_to_combined_iv(combined_iv_path: str = None):
+    """
+    Append VRP adjustment column to combined_iv.csv.
+    
+    The VRP column shows what was added to RV forecasts to get IV estimates.
+    To get the raw RV forecast: *_iv - vrp_adjustment
+    
+    Args:
+        combined_iv_path: Path to combined_iv.csv (defaults to results/combined_iv.csv)
+    """
+    if combined_iv_path is None:
+        combined_iv_path = os.path.join(CONFIG['results_dir'], 'combined_iv.csv')
+    
+    # Load existing combined_iv
+    df = pd.read_csv(combined_iv_path)
+    df['date'] = pd.to_datetime(df['date'])
+    
+    # Load data for VRP calculation
+    prices_df = pd.read_parquet(CONFIG['prices_path'])
+    vix_df = pd.read_parquet(CONFIG['vix_path'])
+    
+    # Create VRP calculator
+    vrp_calc = VarianceRiskPremiumCalculator(
+        prices_df=prices_df,
+        vix_df=vix_df,
+        rv_window=CONFIG['vrp_rv_window'],
+        vrp_lookback=CONFIG['vrp_lookback'],
+        use_regime=CONFIG['vrp_use_regime']
+    )
+    
+    # Fit on data before first date in the IV log
+    vrp_calc.fit(end_date=df['date'].min())
+    
+    # Calculate VRP for each date
+    vrp_values = []
+    for date in df['date']:
+        try:
+            vrp = vrp_calc.get_vrp_adjustment(pd.Timestamp(date), method=CONFIG['vrp_method'])
+        except:
+            vrp = np.nan
+        vrp_values.append(vrp)
+    
+    df['vrp_adjustment'] = vrp_values
+    
+    # Save back
+    df.to_csv(combined_iv_path, index=False)
+    print(f"Added vrp_adjustment column to {combined_iv_path}")
+    print(f"  Mean VRP: {np.nanmean(vrp_values):.4f} ({np.nanmean(vrp_values)*100:.2f}%)")
+    print(f"  To get raw RV forecast: [model]_iv - vrp_adjustment")
 
 
 # ============================================================================

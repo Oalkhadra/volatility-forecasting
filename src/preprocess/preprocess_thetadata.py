@@ -20,6 +20,8 @@ from io import StringIO
 from datetime import datetime, timedelta
 from pathlib import Path
 import sys
+from dateutil.relativedelta import relativedelta
+from calendar import monthrange
 
 # Add parent for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -30,8 +32,8 @@ from pricing.risk_free_rate import get_risk_free_rate
 # =============================================================================
 
 # Date range for options data
-START = '2023-12-05'
-END = '2024-12-04'
+START = '2020-01-01'
+END = '2025-11-30'  # Adjust to your desired end date
 
 # ThetaData terminal connection
 THETA_HOST = "localhost"
@@ -39,10 +41,53 @@ THETA_PORT = 25503
 BASE_URL = f"http://{THETA_HOST}:{THETA_PORT}"
 
 # Output directory
+OUTPUT_RAW = "data/raw"
 OUTPUT_DIR = "data/processed"
 
 # Ticker to process
 TICKER = "SPY"
+
+
+# =============================================================================
+# DATE UTILITIES
+# =============================================================================
+
+def generate_month_ranges(start_date: str, end_date: str):
+    """
+    Generate list of (year, month, start_date, end_date) tuples for each month.
+    
+    Args:
+        start_date: Start date in YYYY-MM-DD format
+        end_date: End date in YYYY-MM-DD format
+    
+    Yields:
+        Tuple of (year, month, month_start, month_end) for each month
+    """
+    start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+    end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+    
+    current_dt = start_dt.replace(day=1)  # Start at beginning of month
+    
+    while current_dt <= end_dt:
+        year = current_dt.year
+        month = current_dt.month
+        
+        # First day of month (or start_date if in first month)
+        if current_dt.year == start_dt.year and current_dt.month == start_dt.month:
+            month_start = start_dt
+        else:
+            month_start = current_dt
+        
+        # Last day of month (or end_date if in last month)
+        last_day = monthrange(year, month)[1]
+        month_end = current_dt.replace(day=last_day)
+        if month_end > end_dt:
+            month_end = end_dt
+        
+        yield (year, month, month_start.strftime('%Y-%m-%d'), month_end.strftime('%Y-%m-%d'))
+        
+        # Move to next month
+        current_dt += relativedelta(months=1)
 
 
 # =============================================================================
@@ -128,9 +173,9 @@ def process_raw_options(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     
     print("  Processing raw data...")
     
-    # Extract date from 'timestamp' column (format: YYYY-MM-DDTHH:mm:ss.SSS)
+    # Extract date from 'timestamp' column (format: YYYY-MM-DDTHH:mm:ss.SSS or YYYY-MM-DDTHH:mm:ss)
     date_col = 'timestamp' if 'timestamp' in df.columns else 'created'
-    df['date'] = pd.to_datetime(df[date_col]).dt.strftime('%Y-%m-%d')
+    df['date'] = pd.to_datetime(df[date_col], format='ISO8601').dt.strftime('%Y-%m-%d')
     
     # Standardize option type
     df['call_put'] = df['right'].str.lower()
@@ -171,7 +216,7 @@ def get_underlying_prices(ticker: str, start_date: str, end_date: str, full_hist
     # Add buffer days for yfinance
     if full_history:
         # Get all available history for ML model pre-training
-        start_dt = datetime(2010, 1, 1)  # Go back to 2010 for full history
+        start_dt = datetime(1993, 1, 29)  # Go back to 1993 for full history
         print(f"    Loading FULL history from {start_dt.strftime('%Y-%m-%d')}")
     else:
         start_dt = datetime.strptime(start_date, '%Y-%m-%d') - timedelta(days=5)
@@ -204,11 +249,7 @@ def get_underlying_prices(ticker: str, start_date: str, end_date: str, full_hist
 def get_vix_data(start_date: str, end_date: str) -> pd.DataFrame:
     """Download VIX data from Yahoo Finance."""
     print(f"  Downloading VIX data...")
-    
-    start_dt = datetime.strptime(start_date, '%Y-%m-%d') - timedelta(days=5)
-    end_dt = datetime.strptime(end_date, '%Y-%m-%d') + timedelta(days=5)
-    
-    df = yf.download("^VIX", start=start_dt, end=end_dt, progress=False, auto_adjust=False)
+    df = yf.download("^VIX", period="max", auto_adjust=False)
     
     if df.empty:
         return pd.DataFrame()
@@ -278,7 +319,7 @@ def merge_risk_free_rate(options_df: pd.DataFrame, rf_df: pd.DataFrame) -> pd.Da
 # DATA FILTERING
 # =============================================================================
 
-def apply_filters(df: pd.DataFrame, min_dte: int = 1, max_dte: int = 120) -> pd.DataFrame:
+def apply_filters(df: pd.DataFrame, min_dte: int = 1, max_dte: int = 30) -> pd.DataFrame:
     """
     Apply liquidity and quality filters.
     
@@ -344,61 +385,80 @@ def apply_filters(df: pd.DataFrame, min_dte: int = 1, max_dte: int = 120) -> pd.
 # MAIN PIPELINE
 # =============================================================================
 
-def download_and_process(
-    symbol: str = "SPY",
-    start_date: str = START,
-    end_date: str = END,
-    output_dir: str = OUTPUT_DIR
-) -> pd.DataFrame:
+def process_month(
+    symbol: str,
+    year: int,
+    month: int,
+    month_start: str,
+    month_end: str,
+    prices_df: pd.DataFrame,
+    rf_df: pd.DataFrame,
+    output_dir: str = OUTPUT_DIR,
+    skip_existing: bool = True
+) -> tuple[pd.DataFrame, int, int]:
     """
-    Full pipeline: download, enrich, filter, and save options data.
+    Process one month of options data.
     
     Args:
         symbol: Underlying ticker
-        start_date: Start date (YYYY-MM-DD)
-        end_date: End date (YYYY-MM-DD)
+        year: Year
+        month: Month (1-12)
+        month_start: Start date for this month (YYYY-MM-DD)
+        month_end: End date for this month (YYYY-MM-DD)
+        prices_df: Pre-loaded underlying prices
+        rf_df: Pre-loaded risk-free rates
         output_dir: Where to save parquet files
+        skip_existing: If True, skip months that already have processed files
     
     Returns:
-        Processed DataFrame
+        Tuple of (processed_df, raw_count, processed_count)
     """
+    month_str = f"{year}_{month:02d}"
+    
+    # Check if already exists
+    output_path = Path(output_dir)
+    processed_file = output_path / f"{symbol.lower()}_options_{month_str}.parquet"
+    
+    if skip_existing and processed_file.exists():
+        print(f"  ⏭️  Skipping {month_str} (already exists)")
+        # Load and return counts
+        existing_df = pd.read_parquet(processed_file)
+        return existing_df, len(existing_df), len(existing_df)
+    
     print(f"\n{'='*60}")
-    print(f"ThetaData Options Preprocessing")
+    print(f"Processing {year}-{month:02d}")
     print(f"{'='*60}")
-    print(f"Symbol: {symbol}")
-    print(f"Date range: {start_date} to {end_date}")
     
     # 1. Fetch historical EOD options data
-    print(f"\n1. Fetching options data...")
-    raw_df = fetch_options_eod(symbol, start_date, end_date)
+    print(f"1. Fetching options data for {month_start} to {month_end}...")
+    raw_df = fetch_options_eod(symbol, month_start, month_end)
     
     if raw_df.empty:
-        print("No options data found!")
-        return pd.DataFrame()
+        print("  No options data found for this month!")
+        return pd.DataFrame(), 0, 0
+    
+    # Store raw data
+    raw_path = Path(OUTPUT_RAW)
+    raw_path.mkdir(parents=True, exist_ok=True)
+    raw_file = raw_path / f"{symbol.lower()}_options_raw_{month_str}.parquet"
+    raw_df.to_parquet(raw_file, compression='snappy', index=False)
+    print(f"  ✓ Raw saved: {raw_file} ({len(raw_df):,} rows)")
     
     # 2. Process raw data
     print(f"\n2. Processing raw data...")
     df = process_raw_options(raw_df, symbol)
     
-    # 3. Get underlying prices (full history for ML pre-training)
-    print(f"\n3. Fetching underlying prices...")
-    prices_df = get_underlying_prices(symbol, start_date, end_date, full_history=True)
-    
-    # 4. Get risk-free rate
-    print(f"\n4. Fetching risk-free rate...")
-    rf_df = get_risk_free_rate(start_date, end_date)
-    
-    # 5. Merge underlying prices
-    print(f"\n5. Enriching data...")
+    # 3. Merge underlying prices and risk-free rate
+    print(f"\n3. Enriching data...")
     df = merge_underlying_prices(df, prices_df)
     df = merge_risk_free_rate(df, rf_df)
     
-    # 6. Apply filters
-    print(f"\n6. Filtering data...")
-    df = apply_filters(df, min_dte=1, max_dte=30)
+    # 4. Apply filters
+    print(f"\n4. Filtering data...")
+    df = apply_filters(df, min_dte=1, max_dte=120)
     
-    # 7. Select final columns
-    print(f"\n7. Finalizing schema...")
+    # 5. Select final columns
+    print(f"\n5. Finalizing schema...")
     columns = [
         'date', 'act_symbol', 'expiration', 'strike', 'call_put',
         'bid', 'ask', 'mid_price', 'spread', 'spread_pct',
@@ -408,54 +468,192 @@ def download_and_process(
     df = df[[c for c in columns if c in df.columns]]
     df = df.sort_values(['date', 'expiration', 'strike', 'call_put']).reset_index(drop=True)
     
-    print(f"  Final columns: {list(df.columns)}")
+    # 6. Save processed data
+    print(f"\n6. Saving processed data...")
+    output_path.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(processed_file, compression='snappy', index=False)
+    print(f"  ✓ Processed saved: {processed_file} ({len(df):,} rows)")
     
-    # 8. Save
-    print(f"\n8. Saving files...")
+    # Summary for this month
+    print(f"\n  Month Summary:")
+    print(f"    Raw records: {len(raw_df):,}")
+    print(f"    After filtering: {len(df):,}")
+    print(f"    Trading days: {df['date'].nunique()}")
+    print(f"    Expirations: {df['expiration'].nunique()}")
+    print(f"    Calls: {(df['call_put'] == 'call').sum():,}")
+    print(f"    Puts: {(df['call_put'] == 'put').sum():,}")
+    
+    return df, len(raw_df), len(df)
+
+
+def download_and_process(
+    symbol: str = "SPY",
+    start_date: str = START,
+    end_date: str = END,
+    output_dir: str = OUTPUT_DIR,
+    skip_existing: bool = True
+) -> dict:
+    """
+    Full pipeline: download, enrich, filter, and save options data MONTHLY.
+    
+    Args:
+        symbol: Underlying ticker
+        start_date: Start date (YYYY-MM-DD)
+        end_date: End date (YYYY-MM-DD)
+        output_dir: Where to save parquet files
+        skip_existing: If True, skip months that already have processed files
+    
+    Returns:
+        Dictionary with summary statistics
+    """
+    print(f"\n{'='*70}")
+    print(f"ThetaData Options Preprocessing - MONTHLY PIPELINE")
+    print(f"{'='*70}")
+    print(f"Symbol: {symbol}")
+    print(f"Date range: {start_date} to {end_date}")
+    print(f"Skip existing: {skip_existing}")
+    
+    # 1. Get underlying prices ONCE (full history for ML)
+    print(f"\n{'='*70}")
+    print("Loading underlying prices and risk-free rates (once)...")
+    print(f"{'='*70}")
+    prices_df = get_underlying_prices(symbol, start_date, end_date, full_history=True)
+    rf_df = get_risk_free_rate(start_date, end_date)
+    
+    # Save these once
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
-    # Save options
-    options_file = output_path / f"{symbol.lower()}_options.parquet"
-    df.to_parquet(options_file, compression='snappy', index=False)
-    print(f"  ✓ Options: {options_file} ({len(df):,} rows)")
-    
-    # Save prices
     if not prices_df.empty:
         prices_file = output_path / f"{symbol.lower()}_prices.parquet"
         prices_df.to_parquet(prices_file, compression='snappy', index=False)
-        print(f"  ✓ Prices: {prices_file}")
+        print(f"✓ Prices saved: {prices_file}")
     
-    # Save risk-free rate
     if not rf_df.empty:
         rf_file = output_path / "risk_free_rate.parquet"
         rf_df.to_parquet(rf_file, compression='snappy', index=False)
-        print(f"  ✓ Risk-free rate: {rf_file}")
+        print(f"✓ Risk-free rate saved: {rf_file}")
     
-    # Summary
-    print(f"\n{'='*60}")
-    print("Summary")
-    print(f"{'='*60}")
-    print(f"  Total options: {len(df):,}")
-    print(f"  Trading days: {df['date'].nunique()}")
-    print(f"  Expirations: {df['expiration'].nunique()}")
-    print(f"  Strikes: {df['strike'].nunique()}")
-    print(f"  Calls: {(df['call_put'] == 'call').sum():,}")
-    print(f"  Puts: {(df['call_put'] == 'put').sum():,}")
+    # 2. Process each month
+    print(f"\n{'='*70}")
+    print("Processing options data by month...")
+    print(f"{'='*70}")
     
-    return df
+    months = list(generate_month_ranges(start_date, end_date))
+    print(f"Total months to process: {len(months)}\n")
+    
+    total_raw = 0
+    total_processed = 0
+    successful_months = 0
+    
+    for i, (year, month, month_start, month_end) in enumerate(months, 1):
+        print(f"\n[Month {i}/{len(months)}]")
+        try:
+            df, raw_count, proc_count = process_month(
+                symbol, year, month, month_start, month_end,
+                prices_df, rf_df, output_dir, skip_existing
+            )
+            total_raw += raw_count
+            total_processed += proc_count
+            if proc_count > 0:
+                successful_months += 1
+        except Exception as e:
+            print(f"  ❌ Error processing {year}-{month:02d}: {e}")
+            continue
+    
+    # 3. Final Summary
+    print(f"\n{'='*70}")
+    print("FINAL SUMMARY")
+    print(f"{'='*70}")
+    print(f"  Months processed: {successful_months}/{len(months)}")
+    print(f"  Total raw records: {total_raw:,}")
+    print(f"  Total filtered records: {total_processed:,}")
+    print(f"  Filter rate: {100*(1-total_processed/total_raw) if total_raw > 0 else 0:.1f}%")
+    print(f"\n  Files saved to:")
+    print(f"    Raw: {Path(OUTPUT_RAW).absolute()}")
+    print(f"    Processed: {Path(output_dir).absolute()}")
+    
+    return {
+        'months_processed': successful_months,
+        'total_months': len(months),
+        'total_raw': total_raw,
+        'total_processed': total_processed
+    }
+
+
+# =============================================================================
+# DATA LOADING UTILITIES
+# =============================================================================
+
+def load_monthly_data(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    output_dir: str = OUTPUT_DIR,
+    data_type: str = "processed"
+) -> pd.DataFrame:
+    """
+    Load multiple months of data into a single DataFrame.
+    
+    Args:
+        symbol: Underlying ticker
+        start_date: Start date (YYYY-MM-DD)
+        end_date: End date (YYYY-MM-DD)
+        output_dir: Directory containing parquet files
+        data_type: Either "processed" or "raw"
+    
+    Returns:
+        Combined DataFrame from all monthly files
+    """
+    print(f"Loading {data_type} data for {symbol} from {start_date} to {end_date}...")
+    
+    months = list(generate_month_ranges(start_date, end_date))
+    all_dfs = []
+    
+    path = Path(OUTPUT_RAW if data_type == "raw" else output_dir)
+    prefix = f"{symbol.lower()}_options_{data_type}_" if data_type == "raw" else f"{symbol.lower()}_options_"
+    
+    for year, month, _, _ in months:
+        month_str = f"{year}_{month:02d}"
+        file_path = path / f"{prefix}{month_str}.parquet"
+        
+        if file_path.exists():
+            df = pd.read_parquet(file_path)
+            all_dfs.append(df)
+            print(f"  ✓ Loaded {month_str}: {len(df):,} rows")
+        else:
+            print(f"  ⚠️  Missing {month_str}")
+    
+    if not all_dfs:
+        print("  No data files found!")
+        return pd.DataFrame()
+    
+    combined = pd.concat(all_dfs, ignore_index=True)
+    print(f"  Total: {len(combined):,} rows")
+    
+    return combined
 
 
 if __name__ == "__main__":
-    # Process options
-    df = download_and_process(TICKER, START, END, OUTPUT_DIR)
+    # Process options monthly
+    # summary = download_and_process(
+    #     symbol=TICKER,
+    #     start_date=START,
+    #     end_date=END,
+    #     output_dir=OUTPUT_DIR,
+    #     skip_existing=True  # Set to False to re-download existing months
+    # )
     
     # Also download VIX
-    print(f"\nDownloading VIX data...")
+    print(f"\n{'='*70}")
+    print("Downloading VIX data...")
+    print(f"{'='*70}")
     vix_df = get_vix_data(START, END)
     if not vix_df.empty:
         vix_file = Path(OUTPUT_DIR) / "vix_data.parquet"
         vix_df.to_parquet(vix_file, compression='snappy', index=False)
         print(f"✓ VIX saved: {vix_file}")
     
-    print("\n✓ Done!")
+    print(f"\n{'='*70}")
+    print("✓ ALL DONE!")
+    print(f"{'='*70}")

@@ -5,16 +5,14 @@ This module defines how trading decisions are made based on
 theoretical pricing vs. market pricing.
 """
 
-from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Tuple, Optional, Union
+from typing import List, Tuple, Optional
 from dataclasses import dataclass
 import pandas as pd
-from tqdm import tqdm
 import numpy as np
 from datetime import datetime
 import sys
 import os
-
+from scipy.stats import norm
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -22,7 +20,127 @@ from pricing.pricer import black_scholes_price, intrinsic_value
 from pricing.greeks import delta
 from volatility.forecasting import GARCHForecaster, MLForecaster
 from volatility.historical import RollingVolCalculator
+from volatility.vrp import VarianceRiskPremiumCalculator
 from backtest.engine import Trade
+
+# ============================================================================
+# VECTORIZED PRICING FUNCTIONS
+# ============================================================================
+
+def black_scholes_price_vectorized(
+    S: float,
+    K: np.ndarray,
+    T: np.ndarray,
+    r: float,
+    sigma: np.ndarray,
+    is_call: np.ndarray  # Boolean array: True for call, False for put
+) -> np.ndarray:
+    """
+    Vectorized Black-Scholes pricing for arrays of options.
+    
+    Args:
+        S: Underlying price (scalar - same for all options)
+        K: Strike prices (array)
+        T: Time to expiry in years (array)
+        r: Risk-free rate (scalar)
+        sigma: Volatilities (array)
+        is_call: Boolean array (True=call, False=put)
+        
+    Returns:
+        Array of option prices
+    """
+    
+    
+    # Handle edge cases with masks
+    at_expiry = T < 1e-6
+    zero_vol = sigma < 1e-6
+    normal_case = ~at_expiry & ~zero_vol
+    
+    # Pre-allocate result array
+    prices = np.zeros_like(K, dtype=np.float64)
+    
+    # At expiry: intrinsic value
+    call_intrinsic = np.maximum(S - K, 0)
+    put_intrinsic = np.maximum(K - S, 0)
+    prices = np.where(at_expiry & is_call, call_intrinsic, prices)
+    prices = np.where(at_expiry & ~is_call, put_intrinsic, prices)
+    
+    # Zero vol: discounted intrinsic
+    discount = np.exp(-r * T)
+    prices = np.where(zero_vol & ~at_expiry & is_call, np.maximum(S - K * discount, 0), prices)
+    prices = np.where(zero_vol & ~at_expiry & ~is_call, np.maximum(K * discount - S, 0), prices)
+    
+    # Normal case: Black-Scholes formula
+    if np.any(normal_case):
+        sqrt_T = np.sqrt(np.where(normal_case, T, 1.0))  # Avoid sqrt(0) warning
+        sigma_sqrt_T = sigma * sqrt_T
+        
+        d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / sigma_sqrt_T
+        d2 = d1 - sigma_sqrt_T
+        
+        # Call price: S*N(d1) - K*e^(-rT)*N(d2)
+        call_price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+        # Put price: K*e^(-rT)*N(-d2) - S*N(-d1)
+        put_price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+        
+        prices = np.where(normal_case & is_call, call_price, prices)
+        prices = np.where(normal_case & ~is_call, put_price, prices)
+    
+    return prices
+
+
+def delta_vectorized(
+    S: float,
+    K: np.ndarray,
+    T: np.ndarray,
+    r: float,
+    sigma: np.ndarray,
+    is_call: np.ndarray  # Boolean array: True for call, False for put
+) -> np.ndarray:
+    """
+    Vectorized delta calculation for arrays of options.
+    
+    Args:
+        S: Underlying price (scalar)
+        K: Strike prices (array)
+        T: Time to expiry in years (array)
+        r: Risk-free rate (scalar)
+        sigma: Volatilities (array)
+        is_call: Boolean array (True=call, False=put)
+        
+    Returns:
+        Array of deltas
+    """
+    
+    # Handle edge cases
+    at_expiry = T < 1e-6
+    normal_case = ~at_expiry
+    
+    # Pre-allocate result
+    deltas = np.zeros_like(K, dtype=np.float64)
+    
+    # At expiry: delta is 1 for ITM calls, -1 for ITM puts, 0 otherwise
+    call_itm = S > K
+    put_itm = S < K
+    deltas = np.where(at_expiry & is_call & call_itm, 1.0, deltas)
+    deltas = np.where(at_expiry & ~is_call & put_itm, -1.0, deltas)
+    
+    # Normal case: N(d1) for calls, N(d1) - 1 for puts
+    if np.any(normal_case):
+        # Avoid division by zero
+        sigma_safe = np.where(sigma > 1e-6, sigma, 1e-6)
+        sqrt_T = np.sqrt(np.where(T > 0, T, 1e-6))
+        
+        d1 = (np.log(S / K) + (r + 0.5 * sigma_safe**2) * T) / (sigma_safe * sqrt_T)
+        
+        call_delta = norm.cdf(d1)
+        put_delta = call_delta - 1.0
+        
+        deltas = np.where(normal_case & is_call, call_delta, deltas)
+        deltas = np.where(normal_case & ~is_call, put_delta, deltas)
+    
+    return deltas
+
 
 # ============================================================================
 # CONSTANTS
@@ -78,14 +196,18 @@ class MispricingStrategy():
                  vol_model,
                  options_data: Optional[pd.DataFrame] = None,
                  prices_data: Optional[pd.DataFrame] = None,
-                 threshold: float = 0.10,
-                 exit_threshold: float = 0.10,
+                 buy_threshold: float = 0.50,
+                 sell_threshold: float = 0.80,
+                 exit_threshold_buy: float = 0.50,
+                 exit_threshold_sell: float = 1.00,
                  max_positions: int = 5,
                  contracts_per_trade: int = 100,
                  max_leverage: float = 1.0,
                  max_position_pct: float = 0.50,
                  max_short_exposure: float = 0.30,
-                 risk_premium: float = 0.0):
+                 risk_premium: float = 0.0,
+                 vrp_calculator: Optional[VarianceRiskPremiumCalculator] = None,
+                 vrp_method: str = 'rolling'):
         """
         Initialize mispricing strategy.
         
@@ -94,21 +216,27 @@ class MispricingStrategy():
             returns_data: Historical returns for GARCH/ML models
             options_data: Full options dataset for vol surface refitting
             prices_data: Price data for historical volatility calculator
-            threshold: Minimum mispricing % to trade (e.g., 0.10 = 10%)
-            exit_threshold: Mispricing % below which to exit early (e.g., 0.05 = 5%)
-                           Set to 0.0 to disable early exits (hold to expiry)
+            buy_threshold: Minimum underpricing to buy (e.g., 0.50 = buy if market < 50% of theo)
+            sell_threshold: Minimum overpricing to sell (e.g., 0.80 = sell if market > 80% above theo)
+            exit_threshold_buy: Exit long if mispricing rises above this (e.g., -0.50 becomes fair)
+            exit_threshold_sell: Exit short if mispricing falls below this (e.g., +1.00 becomes fair)
             max_positions: Maximum number of option positions to hold
             contracts_per_trade: Max number of contracts per trade (reduced if capital limits hit)
             max_leverage: Maximum total capital usage / equity ratio (e.g., 3.0 = 3x)
             max_position_pct: Maximum single position capital as % of equity
             max_short_exposure: Maximum short position value as % of equity
-            risk_premium: Variance risk premium multiplier (e.g., 0.15 = add 15% to vol forecast)
-                         Set to 0.0 to disable. Applies to realized vol models (GARCH, Historical)
-                         Typical range: 0.10-0.30. Accounts for IV > RV on average.
+            risk_premium: Variance risk premium multiplier (DEPRECATED - use vrp_calculator instead)
+                         Fallback if vrp_calculator is None.
+            vrp_calculator: VarianceRiskPremiumCalculator for dynamic VRP adjustment.
+                           If provided, uses empirical VRP instead of fixed risk_premium.
+            vrp_method: VRP estimation method ('rolling', 'regime', or 'regime_rolling')
+                       Only used if vrp_calculator is provided.
         """
         self.vol_model = vol_model
-        self.threshold = threshold
-        self.exit_threshold = exit_threshold
+        self.buy_threshold = buy_threshold
+        self.sell_threshold = sell_threshold
+        self.exit_threshold_buy = exit_threshold_buy
+        self.exit_threshold_sell = exit_threshold_sell
         self.options_data = options_data
         self.prices_data = prices_data
         self.max_positions = max_positions
@@ -117,6 +245,8 @@ class MispricingStrategy():
         self.max_position_pct = max_position_pct
         self.max_short_exposure = max_short_exposure
         self.risk_premium = risk_premium
+        self.vrp_calculator = vrp_calculator
+        self.vrp_method = vrp_method
         self.model_name = vol_model.__class__.__name__
     
     def calculate_capital_usage(self, portfolio) -> Tuple[float, float, float]:
@@ -151,10 +281,7 @@ class MispricingStrategy():
                 # Stock value: quantity * price
                 position_value = abs(pos.quantity) * pos.current_price
                 capital_used += position_value
-                
-                # Track short stock exposure
-                if pos.quantity < 0:
-                    short_exposure += position_value
+                # Note: Short stock (delta hedges) excluded from short_exposure limit
         
         # Calculate current equity (cash + positions value)
         current_equity = portfolio.cash
@@ -204,8 +331,36 @@ class MispricingStrategy():
         # Scalar volatility
         return float(self.vol_model)
     
-    def _apply_risk_premium(self, sigma: float) -> float:
-        """Apply variance risk premium adjustment to volatility."""
+    def _apply_risk_premium(self, sigma: float, current_date: datetime = None) -> float:
+        """
+        Apply variance risk premium adjustment to volatility.
+        
+        If vrp_calculator is provided, uses empirical VRP (additive).
+        Otherwise falls back to fixed risk_premium multiplier (multiplicative).
+        
+        Args:
+            sigma: Base volatility forecast (realized vol)
+            current_date: Current date for VRP lookup (required if using vrp_calculator)
+            
+        Returns:
+            Adjusted volatility estimate (approximates implied vol)
+        """
+        if self.vrp_calculator is not None:
+            # Use empirical VRP (additive adjustment)
+            date_to_use = current_date
+            if date_to_use is not None:
+                try:
+                    vrp = self.vrp_calculator.get_vrp_adjustment(
+                        pd.Timestamp(date_to_use), 
+                        method=self.vrp_method
+                    )
+                    # VRP is additive: IV ≈ RV + VRP
+                    return max(sigma + vrp, 0.05)  # Floor at 5%
+                except Exception as e:
+                    # Fallback to fixed premium if VRP lookup fails
+                    pass
+        
+        # Fallback: fixed multiplicative risk premium
         if self.risk_premium > 0:
             return sigma * (1 + self.risk_premium)
         return sigma
@@ -226,6 +381,7 @@ class MispricingStrategy():
             T: Time to expiration (years)
             r: Risk-free rate
             option_type: 'call' or 'put'
+            current_date: Current date for VRP adjustment
             
         Returns:
             Tuple of (theoretical_price, sigma_used)
@@ -234,7 +390,7 @@ class MispricingStrategy():
             return intrinsic_value(S=S, K=K, option_type=option_type), 0.0
 
         sigma = self._get_vol_forecast(T * 365, current_date)
-        sigma = self._apply_risk_premium(sigma)
+        sigma = self._apply_risk_premium(sigma, current_date)
         theo = black_scholes_price(S=S, K=K, T=T, r=r, sigma=sigma, option_type=option_type)
         
         return theo, sigma
@@ -248,7 +404,7 @@ class MispricingStrategy():
             current_date: Current date
             
         Returns:
-            Array of volatilities for each option (with risk premium applied)
+            Array of volatilities for each option (with VRP/risk premium applied)
         """    
         if isinstance(self.vol_model, (GARCHForecaster, MLForecaster)):
             if self.vol_model.is_fitted:
@@ -263,8 +419,21 @@ class MispricingStrategy():
             single_sigma = self._get_vol_forecast(30, current_date)  # DTE doesn't matter for these
             sigmas = np.full(len(df), single_sigma)
         
-        # Apply risk premium
-        if self.risk_premium > 0:
+        # Apply VRP adjustment (vectorized)
+        if self.vrp_calculator is not None:
+            try:
+                vrp = self.vrp_calculator.get_vrp_adjustment(
+                    pd.Timestamp(current_date), 
+                    method=self.vrp_method
+                )
+                # VRP is additive: IV ≈ RV + VRP
+                sigmas = np.maximum(sigmas + vrp, 0.05)  # Floor at 5%
+            except Exception:
+                # Fallback to fixed premium if VRP lookup fails
+                if self.risk_premium > 0:
+                    sigmas = sigmas * (1 + self.risk_premium)
+        elif self.risk_premium > 0:
+            # Legacy: fixed multiplicative risk premium
             sigmas = sigmas * (1 + self.risk_premium)
         
         return sigmas
@@ -319,8 +488,8 @@ class MispricingStrategy():
         """
         closing_trades = []
         
-        # Early exit disabled if threshold is 0
-        if self.exit_threshold <= 0:
+        # Early exit disabled if both thresholds are 0
+        if self.exit_threshold_buy <= 0 and self.exit_threshold_sell <= 0:
             return []
         
         # Loop through all option positions
@@ -344,7 +513,7 @@ class MispricingStrategy():
             # Calculate time to expiry
             T = max(0, (pos.expiry - current_date).days / 365.0)
             
-            # Skip very near expiry options (let them expire naturally) ---------------------------------------------------------------------------
+            # Skip very near expiry options (let them expire naturally)
             if T < 0.01:  # Less than ~4 days
                 continue
             
@@ -360,13 +529,25 @@ class MispricingStrategy():
             
             # Calculate current mispricing
             if theo_price > 0:
-                current_mispricing = abs((market_price - theo_price) / theo_price)
+                current_mispricing = (market_price - theo_price) / theo_price
             else:
                 print("Warning! Negative theoretical calculated, check pipeline!")
                 continue 
             
-            # Check if mispricing has converged to fair value
-            if current_mispricing < self.exit_threshold:
+            # Check if mispricing has converged to fair value using asymmetric thresholds
+            # Long positions (bought underpriced): exit if mispricing rises above -exit_threshold_buy
+            # Short positions (sold overpriced): exit if mispricing falls below exit_threshold_sell
+            should_exit = False
+            if pos.quantity > 0:  # Long position (we bought underpriced)
+                # Originally mispricing was negative (market < theo)
+                # Exit if it's no longer underpriced enough: mispricing > -exit_threshold_buy
+                should_exit = current_mispricing > -self.exit_threshold_buy
+            else:  # Short position (we sold overpriced)
+                # Originally mispricing was positive (market > theo)
+                # Exit if it's no longer overpriced enough: mispricing < exit_threshold_sell
+                should_exit = current_mispricing < self.exit_threshold_sell
+            
+            if should_exit:
                 # Calculate delta for hedge unwinding
                 opt_delta = delta(underlying_price, pos.strike, T, risk_free_rate, sigma, pos.option_type)
                 
@@ -453,35 +634,27 @@ class MispricingStrategy():
         # Handle near-expiration cases (vectorized)
         near_expiry_mask = df['T'] < 1e-6
         
-        # Vectorized theoretical price calculation
-        # For near-expiry: use intrinsic value
-        # For normal cases: use Black-Scholes (vectorized via numpy arrays)
-        df['theo_price'] = np.where(
-            near_expiry_mask,
-            # Intrinsic value for near expiry (vectorized)
-            np.where(
-                df['call_put'] == 'call',
-                np.maximum(underlying_price - df['strike'], 0),
-                np.maximum(df['strike'] - underlying_price, 0)
-            ),
-            # Black-Scholes for normal cases
-            # Note: BS function uses numpy internally, so array inputs work efficiently
-            np.array([
-                black_scholes_price(underlying_price, K, T, risk_free_rate, sig, opt_type)
-                for K, T, sig, opt_type in zip(
-                    df['strike'].values,
-                    df['T'].values,
-                    df['sigma'].values,
-                    df['call_put'].values
-                )
-            ])
+        # Truly vectorized theoretical price calculation using numpy arrays
+        is_call = (df['call_put'] == 'call').values
+        
+        df['theo_price'] = black_scholes_price_vectorized(
+            S=underlying_price,
+            K=df['strike'].values,
+            T=df['T'].values,
+            r=risk_free_rate,
+            sigma=df['sigma'].values,
+            is_call=is_call
         )
         
         # Calculate mispricing percentage (vectorized)
         df['mispricing_pct'] = (df['mid_price'] - df['theo_price']) / df['theo_price']
         
-        # Filter for mispricings above threshold (vectorized)
-        df_mispriced = df[df['mispricing_pct'].abs() > self.threshold].copy()
+        # Filter for mispricings above asymmetric thresholds (vectorized)
+        # Buy if underpriced: mispricing_pct < -buy_threshold (negative = market < theo)
+        # Sell if overpriced: mispricing_pct > sell_threshold (positive = market > theo)
+        buy_candidates = df['mispricing_pct'] < -self.buy_threshold
+        sell_candidates = df['mispricing_pct'] > self.sell_threshold
+        df_mispriced = df[buy_candidates | sell_candidates].copy()
         
 
         # In strategy.py, add filter before calculating deltas
@@ -496,16 +669,17 @@ class MispricingStrategy():
         # Determine action (vectorized)
         df_mispriced['action'] = np.where(df_mispriced['mispricing_pct'] > 0, 'sell', 'buy')
         
-        # Calculate deltas (vectorized delta calculation)
-        df_mispriced['delta'] = np.array([
-            delta(underlying_price, K, T, risk_free_rate, sig, opt_type)
-            for K, T, sig, opt_type in zip(
-                df_mispriced['strike'].values,
-                df_mispriced['T'].values,
-                df_mispriced['sigma'].values,
-                df_mispriced['call_put'].values
-            )
-        ])
+        # Truly vectorized delta calculation
+        is_call_mispriced = (df_mispriced['call_put'] == 'call').values
+        
+        df_mispriced['delta'] = delta_vectorized(
+            S=underlying_price,
+            K=df_mispriced['strike'].values,
+            T=df_mispriced['T'].values,
+            r=risk_free_rate,
+            sigma=df_mispriced['sigma'].values,
+            is_call=is_call_mispriced
+        )
         
         # Sort by mispricing magnitude before position sizing
         # This ensures best opportunities get capital first
@@ -626,7 +800,8 @@ class MispricingStrategy():
                 expiry=signal.expiry,
                 option_type=signal.option_type,
                 implied_vol=signal.implied_vol,
-                delta=signal.delta
+                delta=signal.delta,
+                mispricing_pct=signal.mispricing_pct
             )
             
         elif trade_type == 'stock':
