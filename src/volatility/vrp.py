@@ -37,8 +37,8 @@ class VarianceRiskPremiumCalculator:
     # Regime thresholds (VIX levels, in percentage points)
     # These are based on historical VIX distribution
     REGIME_THRESHOLDS = {
-        'low': 12.0,      # VIX < 12: calm markets
-        'medium': 25.0,   # 12 <= VIX < 25: normal markets
+        'low': 15.0,      # VIX < 15: calm markets
+        'medium': 25.0,   # 15 <= VIX < 25: normal markets
                           # VIX >= 25: high volatility / crisis
     }
     

@@ -59,12 +59,10 @@ class GARCHForecaster:
         self.omega = result.params['omega']
         self.alpha = result.params['alpha[1]']
         self.beta = result.params['beta[1]']
-        # Keep current_variance in percentage-squared scale to match omega
-        # (returns are in percentage scale, so arch parameters are too)
         self.current_variance = result.conditional_volatility.iloc[-1] ** 2
         self.is_fitted = True
 
-    def forecast(self, horizon: int = 1) -> float:
+    def forecast(self, horizon: int = 30) -> float:
         """
         Forecast volatility h steps ahead.
         
@@ -88,7 +86,6 @@ class GARCHForecaster:
         
         # Handle IGARCH case (alpha + beta >= 1) where long-run variance is undefined
         if persistence >= 0.9999:
-            # For IGARCH, variance forecast decays from current variance
             # Use simplified forecast: current_var * persistence^horizon
             var_forecast = current_var * (persistence ** horizon)
         else:
@@ -96,7 +93,6 @@ class GARCHForecaster:
             var_forecast = long_run_var + (persistence ** horizon) * (current_var - long_run_var)
 
         # Convert to annualized volatility in decimal scale
-        # sqrt(var * 252) gives percentage scale, divide by 100 for decimal
         return np.sqrt(var_forecast * 252) / 100
 
 
@@ -127,11 +123,9 @@ class MLForecaster:
         self.model = xgb.XGBRegressor(
             n_estimators=300,
             max_depth=3,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            random_state=42,
-            objective='reg:squarederror'
+            learning_rate=0.01,
+            random_state=115,
+            objective=asymmetric_squared_error
         )
         
         self.is_fitted = False
@@ -139,67 +133,68 @@ class MLForecaster:
         self.feature_names = []
         self.scaler = None  # For feature scaling if needed
         self._last_returns = None  # Store returns for forecasting
-        
-    def _create_features(self, returns: pd.Series, lookback = 30, horizon = None) -> np.ndarray:
-        """
-        Create feature matrix from returns.
-        
-        Features:
-        1. Lagged realized vols (5d, 10d, 20d, 30d)
-        
-        Args:
-            returns: Return series (log returns, already computed)
-            lookback: How far back to look for features
-            
-        Returns:
-            Feature array [rv_5d, rv_10d, rv_20d, rv_30d, ret_1d, ...]
-        """
-        n = len(returns)
-        features_list = []
-        
-        # For each time point (after warmup period)
-        for i in range(lookback, n):
-            # Get returns UP TO time i
-            past_returns = returns.iloc[:i]
-            
-            # Calculate realized vol directly from returns (no log transform needed)
-            # Returns are already in percentage scale (log_ret * 100 from engine.py)
-            # So we calculate std and annualize
-            rv_5 = past_returns.iloc[-5:].std() * np.sqrt(252)
-            rv_10 = past_returns.iloc[-10:].std() * np.sqrt(252)
-            rv_20 = past_returns.iloc[-20:].std() * np.sqrt(252)
-            rv_30 = past_returns.iloc[-30:].std() * np.sqrt(252)
-            
-            # Recent returns
-            ret_1d = past_returns.iloc[-1]
-            ret_5d = past_returns.iloc[-5:].sum()
-            ret_10d = past_returns.iloc[-10:].sum()
-            
-            # Higher moments (last 30 days)
-            skew_30 = past_returns.iloc[-30:].skew()
-            kurt_30 = past_returns.iloc[-30:].kurtosis()
-            
-            # Build feature dict for this time point
-            features = {
-                'rv_5d': rv_5,
-                'rv_10d': rv_10,
-                'rv_20d': rv_20,
-                'rv_30d': rv_30,
-                'ret_1d': ret_1d,
-                'ret_5d': ret_5d,
-                'ret_10d': ret_10d,
-                'skew_30d': skew_30,
-                'kurt_30d': kurt_30,
-            }
-            
-            features_list.append(features)
-        
-        
-        # Convert to DataFrame
-        df = pd.DataFrame(features_list)
+        self._last_vix = None  # Store VIX for forecasting
+    
+    def _create_features(self, returns: pd.Series, vix: pd.Series, lookback: int = 30, horizon: int = 30) -> pd.DataFrame:
+        returns = returns.reset_index(drop=True)
+        vix = vix.reset_index(drop=True)
 
-        # Add horizon as a feature
-        df['horizon'] = horizon
+
+        # ===========================================
+        # Lagged VIX
+        # ===========================================
+        yesterday_vix = vix.shift(1)
+
+        # ===========================================
+        # REALIZED VOLATILITY FEATURES
+        # ===========================================
+        rv_1d = (np.abs(returns) * np.sqrt(252)).shift(1)            # Yesterday's |return|
+        rv_5d = (returns.rolling(5).std() * np.sqrt(252)).shift(1)   # Past 5 days (t-5 to t-1)
+        rv_22d = (returns.rolling(22).std() * np.sqrt(252)).shift(1) # Past 22 days (t-22 to t-1)
+        rv_30d = (returns.rolling(30).std() * np.sqrt(252)).shift(1) # Past 30 days (t-30 to t-1)
+        rv_60d = (returns.rolling(60).std() * np.sqrt(252)).shift(1) # Past 60 days (t-60 to t-1)
+        rv_120d = (returns.rolling(120).std() * np.sqrt(252)).shift(1) # Past 120 days (t-120 to t-1)
+
+
+        # ===========================================
+        # LEVERAGE EFFECT (Black 1976)
+        # ===========================================
+        ret_1d = returns.shift(1)  # Yesterday's return
+        ret_22d = returns.rolling(22).sum().shift(1) # Cumulative return t-22 to t-1
+        ret_30d = returns.rolling(30).sum().shift(1) # Cumulative return t-30 to t-1
+        ret_60d = returns.rolling(60).sum().shift(1) # Cumulative return t-60 to t-1
+        ret_120d = returns.rolling(120).sum().shift(1) # Cumulative return t-120 to t-1
+        
+        # ===========================================
+        # ASYMMETRIC/SIGNED VOLATILITY (Patton & Sheppard 2015)
+        # ===========================================
+        neg_returns = returns.clip(upper=0)  # Negative returns only
+        
+        # Realized semivariance: sqrt(sum(r^2)) * sqrt(252) / 100
+        rsv_neg_5d = (np.sqrt((neg_returns**2).rolling(5).sum()) * np.sqrt(252)).shift(1)
+
+        # ===========================================
+        # BUILD DATAFRAME
+        # ===========================================
+        df = pd.DataFrame({
+            'yesterday_vix': yesterday_vix,
+            'rv_1d': rv_1d,
+            'rv_5d': rv_5d,
+            'rv_22d': rv_22d,       
+            'rv_30d': rv_30d,
+            'rv_60d': rv_60d,
+            'rv_120d': rv_120d,
+            'ret_1d': ret_1d,
+            'ret_22d': ret_22d,
+            'ret_30d': ret_30d,
+            'ret_60d': ret_60d,
+            'ret_120d': ret_120d,
+            'rsv_neg_5d': rsv_neg_5d,
+            'horizon': horizon
+        })
+        
+        # Trim to start after lookback (ensures enough history for all features)
+        df = df.iloc[lookback:].reset_index(drop=True)
 
         # Store feature names
         self.feature_names = df.columns.tolist()
@@ -233,7 +228,7 @@ class MLForecaster:
         
         return target_slice.values
     
-    def fit(self, returns: pd.Series, min_train_size = 30, horizons = [1, 3, 5, 7, 14, 21, 30]) -> None:
+    def fit(self, returns: pd.Series, vix: pd.Series, min_train_size = 30, horizons = [30]) -> None:
         """
         Fit ML model to return series.
         
@@ -242,6 +237,7 @@ class MLForecaster:
         
         Args:
             returns: Historical returns
+            vix: Historical VIX
             min_train_size: Minimum returns needed to fit
                     
         Hints:
@@ -258,18 +254,20 @@ class MLForecaster:
         # If pretrained and already fitted, just update the returns cache
         if self.pretrained and self.is_fitted:
             self._last_returns = returns.copy()
+            self._last_vix = vix.copy()
             return
             
         if len(returns) < min_train_size:
             raise ValueError(f"Need at least {min_train_size} returns to fit ML model")
         
-        # Store returns for forecasting
+        # Store returns and VIX for forecasting
         self._last_returns = returns.copy()
+        self._last_vix = vix.copy()
         
         # 1. Create Features and Targets
         all_X, all_y = [], []
         for h in horizons:
-            X = self._create_features(returns, horizon=h)
+            X = self._create_features(returns, vix, horizon=h)
             y = self._create_targets(returns, horizon=h)
             
             # Align X and y: targets are shorter because they need forward data
@@ -303,7 +301,7 @@ class MLForecaster:
         
         print(f"  MLForecaster trained on {len(X_combined)} samples across {len(horizons)} horizons")
     
-    def pretrain(self, prices_df: pd.DataFrame, cutoff_date, horizons = [1, 3, 5, 7, 14, 21, 30, 40, 50, 60, 80, 100, 120]) -> None:
+    def pretrain(self, prices_df: pd.DataFrame, vix_df: pd.Series, cutoff_date, horizons = [30]) -> None:
         """
         Pre-train the model on historical data before a cutoff date.
         
@@ -327,6 +325,7 @@ class MLForecaster:
             raise ValueError(f"Not enough historical data for pre-training. Have {len(historical)}, need at least 100")
         
         returns = historical['log_ret'].dropna()
+        vix = vix_df['vix_close'].dropna()
         print(f"  Training on {len(returns)} historical returns")
         
         # Mark as pretrained so future fit() calls just update returns cache
@@ -334,66 +333,91 @@ class MLForecaster:
         self.is_fitted = False  # Temporarily unset so fit() actually trains
         
         # Train the model
-        self.fit(returns, horizons=horizons)
+        self.fit(returns, vix, horizons=horizons)
         
         # Now mark as pretrained
         self.pretrained = True
         print(f"  Pre-training complete!")
 
-    def _create_current_features(self, returns: pd.Series, horizon: int = 7) -> pd.DataFrame:
+    def _create_current_features(self, returns: pd.Series, vix: pd.Series, horizon: int = 30) -> pd.DataFrame:
         """
         Create features for ONLY the most recent timestamp (optimized for forecasting).
         
-        This is much faster than _create_features() which loops through all history.
+        This matches the exact feature format from _create_features() but only
+        computes for the current time point (much faster for forecasting).
         
         Args:
-            returns: Return series (needs at least 30 values)
+            returns: Return series (needs at least 120 values for all features)
+            vix: VIX series
             horizon: Forecast horizon
             
         Returns:
             Single-row DataFrame with features for the current time point
         """
-        if len(returns) < 30:
-            raise ValueError("Need at least 30 returns to create features")
+        if len(returns) < 120:
+            raise ValueError("Need at least 120 returns to create features")
         
-        # Calculate realized vol directly from recent returns
-        rv_5 = returns.iloc[-5:].std() * np.sqrt(252)
-        rv_10 = returns.iloc[-10:].std() * np.sqrt(252)
-        rv_20 = returns.iloc[-20:].std() * np.sqrt(252)
-        rv_30 = returns.iloc[-30:].std() * np.sqrt(252)
+        # ===========================================
+        # Lagged VIX (yesterday's VIX)
+        # ===========================================
+        yesterday_vix = vix.iloc[-1]
         
-        # Recent returns
-        ret_1d = returns.iloc[-1]
-        ret_5d = returns.iloc[-5:].sum()
-        ret_10d = returns.iloc[-10:].sum()
+        # ===========================================
+        # REALIZED VOLATILITY FEATURES
+        # ===========================================
+        rv_1d = np.abs(returns.iloc[-1]) * np.sqrt(252)  # Yesterday's |return|
+        rv_5d = returns.iloc[-5:].std() * np.sqrt(252)   # Past 5 days
+        rv_22d = returns.iloc[-22:].std() * np.sqrt(252) # Past 22 days
+        rv_30d = returns.iloc[-30:].std() * np.sqrt(252) # Past 30 days
+        rv_60d = returns.iloc[-60:].std() * np.sqrt(252) # Past 60 days
+        rv_120d = returns.iloc[-120:].std() * np.sqrt(252) # Past 120 days
         
-        # Higher moments (last 30 days)
-        skew_30 = returns.iloc[-30:].skew()
-        kurt_30 = returns.iloc[-30:].kurtosis()
+        # ===========================================
+        # LEVERAGE EFFECT (Black 1976)
+        # ===========================================
+        ret_1d = returns.iloc[-1]  # Yesterday's return
+        ret_22d = returns.iloc[-22:].sum()  # Cumulative return last 22 days
+        ret_30d = returns.iloc[-30:].sum()  # Cumulative return last 30 days
+        ret_60d = returns.iloc[-60:].sum()  # Cumulative return last 60 days
+        ret_120d = returns.iloc[-120:].sum()  # Cumulative return last 120 days
         
-        # Build feature dict
+        # ===========================================
+        # ASYMMETRIC/SIGNED VOLATILITY (Patton & Sheppard 2015)
+        # ===========================================
+        neg_returns = returns.iloc[-5:].clip(upper=0)  # Negative returns only (last 5 days)
+        rsv_neg_5d = np.sqrt((neg_returns**2).sum()) * np.sqrt(252)
+        
+        # ===========================================
+        # BUILD DATAFRAME (same column order as _create_features)
+        # ===========================================
         features = {
-            'rv_5d': rv_5,
-            'rv_10d': rv_10,
-            'rv_20d': rv_20,
-            'rv_30d': rv_30,
+            'yesterday_vix': yesterday_vix,
+            'rv_1d': rv_1d,
+            'rv_5d': rv_5d,
+            'rv_22d': rv_22d,
+            'rv_30d': rv_30d,
+            'rv_60d': rv_60d,
+            'rv_120d': rv_120d,
             'ret_1d': ret_1d,
-            'ret_5d': ret_5d,
-            'ret_10d': ret_10d,
-            'skew_30d': skew_30,
-            'kurt_30d': kurt_30,
-            'horizon': horizon,
+            'ret_22d': ret_22d,
+            'ret_30d': ret_30d,
+            'ret_60d': ret_60d,
+            'ret_120d': ret_120d,
+            'rsv_neg_5d': rsv_neg_5d,
+            'horizon': horizon
         }
         
         return pd.DataFrame([features])
 
-    def forecast(self, returns: pd.Series = None, horizon = 7) -> float:
+    def forecast(self, returns: pd.Series = None, vix: pd.Series = None, horizon: int = 30) -> float:
         """
         Generate volatility forecast using most recent data.
         
         Args:
             returns: Historical returns (to create features from).
                     If None, uses cached returns from last fit() call.
+            vix: VIX series. If None, uses cached VIX from last fit() call.
+            horizon: Forecast horizon in days (default 30)
             
         Returns:
             Forecasted annualized volatility for next 'horizon' days (decimal, e.g., 0.15 for 15%)
@@ -408,13 +432,19 @@ class MLForecaster:
                 raise ValueError("No returns provided and no cached returns available")
             returns = self._last_returns
         
+        # Use provided VIX or fall back to cached VIX
+        if vix is None:
+            if self._last_vix is None:
+                raise ValueError("No VIX provided and no cached VIX available")
+            vix = self._last_vix
+        
         # Create features for ONLY the current timestamp (fast!)
-        current_features = self._create_current_features(returns, horizon=horizon)
+        current_features = self._create_current_features(returns, vix, horizon=horizon)
         
         # Predict
         prediction = self.model.predict(current_features)[0]
         
-        return float(prediction) / 100 # Convert Vol estimate to decimal
+        return float(prediction) / 100  # Convert Vol estimate to decimal
     
     def get_feature_importance(self) -> pd.DataFrame:
         """
@@ -436,6 +466,31 @@ class MLForecaster:
 
 
 # Comparison and helper functions
+
+def asymmetric_squared_error(y_true, y_pred):
+    """
+    Custom XGBoost objective that penalizes underprediction more.
+    Underpredicting vol → theo too low → sell signals → dangerous short positions.
+    
+    Args:
+        y_true: Actual forward RV
+        y_pred: Model's prediction
+        
+    Returns:
+        gradient, hessian for XGBoost
+    """
+    # Loss function weights
+    under_weight = 1.2
+    over_weight = 1.0
+    
+    residual = y_pred - y_true  # Positive = overprediction, Negative = underprediction
+    
+    weights = np.where(residual < 0, under_weight, over_weight)
+    
+    grad = weights * residual
+    hess = weights * np.ones_like(residual)
+    
+    return grad, hess
 
 def calculate_forecast_accuracy(
     forecasts: pd.Series,

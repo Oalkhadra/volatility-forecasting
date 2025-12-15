@@ -207,7 +207,9 @@ class MispricingStrategy():
                  max_short_exposure: float = 0.30,
                  risk_premium: float = 0.0,
                  vrp_calculator: Optional[VarianceRiskPremiumCalculator] = None,
-                 vrp_method: str = 'rolling'):
+                 vrp_method: str = 'rolling',
+                 use_all_dte: bool = True,
+                 target_dte: int = 30):
         """
         Initialize mispricing strategy.
         
@@ -231,6 +233,8 @@ class MispricingStrategy():
                            If provided, uses empirical VRP instead of fixed risk_premium.
             vrp_method: VRP estimation method ('rolling', 'regime', or 'regime_rolling')
                        Only used if vrp_calculator is provided.
+            use_all_dte: If True, trade all DTEs. If False, only trade options with target_dte.
+            target_dte: Specific DTE to trade when use_all_dte=False.
         """
         self.vol_model = vol_model
         self.buy_threshold = buy_threshold
@@ -247,6 +251,8 @@ class MispricingStrategy():
         self.risk_premium = risk_premium
         self.vrp_calculator = vrp_calculator
         self.vrp_method = vrp_method
+        self.use_all_dte = use_all_dte
+        self.target_dte = target_dte
         self.model_name = vol_model.__class__.__name__
     
     def calculate_capital_usage(self, portfolio) -> Tuple[float, float, float]:
@@ -443,7 +449,8 @@ class MispricingStrategy():
         Update vol model with data available up to current_date.
         
         For VolatilitySurface: Refit surface weekly
-        For GARCH/ML: Could refit with expanding window.
+        For GARCH: Could refit with expanding window.
+        For ML: Only use historically trained model.
         For Historical vol: No need to update, calculated when needed
         
         Args:
@@ -463,6 +470,7 @@ class MispricingStrategy():
         elif isinstance(self.vol_model, MLForecaster):
             pass
             
+
 
     def check_early_exits(self,
                          portfolio,
@@ -624,6 +632,12 @@ class MispricingStrategy():
         
         # Create a copy to avoid modifying original
         df = options_snapshot.copy()
+        
+        # Filter by DTE if not using all DTEs
+        if not self.use_all_dte:
+            df = df[df['days_to_expiry'] == self.target_dte]
+            if len(df) == 0:
+                return []
         
         # Calculate time to expiry in years (vectorized)
         df['T'] = df['days_to_expiry'] / 365

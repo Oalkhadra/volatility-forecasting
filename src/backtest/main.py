@@ -7,10 +7,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
 from datetime import datetime
 from typing import Dict, Tuple
-
 from backtest.engine import BacktestEngine
 from backtest.strategy import MispricingStrategy
 from volatility.forecasting import GARCHForecaster, MLForecaster
@@ -35,16 +33,16 @@ CONFIG = {
     
     # Strategy parameters - asymmetric thresholds
     'buy_threshold': 0.50,         # 50% underpriced to buy (mispricing < -50%)
-    'sell_threshold': 1.0,        # 80% overpriced to sell (mispricing > +100%)
-    'exit_threshold_buy': 0.25,    # Exit long if mispricing rises above -50% (fair value range)
-    'exit_threshold_sell': 0.50,   # Exit short if mispricing falls below +100% (fair value range)
+    'sell_threshold': 0.80,        # 80% overpriced to sell (mispricing > +80%)
+    'exit_threshold_buy': 0.25,    # Exit position if mispricing within 25% of fair value
+    'exit_threshold_sell': 0.25,   # Exit position if mispricing within 25% of fair value
     'max_positions': 21,
     'contracts_per_trade': 2,     # Max contracts per trade (will be reduced if needed)
     
     # Risk management parameters
     'max_leverage': 1,            # Max total capital usage / equity ratio
     'max_position_pct': 0.50,     # Max single position as % of equity
-    'max_short_exposure': 0.4,   # Max margin requirement for short positions (20% of notional) as % of equity 
+    'max_short_exposure': 0.4,    # Max exposure for short positions (20% of notional) <= 30% of equity 
      
     # Model parameters
     'historical_window': 30,  # 30-day rolling window
@@ -58,6 +56,10 @@ CONFIG = {
     
     # Legacy: Fixed risk premium (only used if use_vrp_calculator=False)
     'risk_premium_fallback': 0.1,
+    
+    # DTE filtering
+    'use_all_dte': False,          # If True, trade all DTEs (1-120). If False, use target_dte
+    'target_dte': 30,             # Specific DTE to trade when use_all_dte=False
     
     # Output
     'results_dir': 'results',
@@ -127,7 +129,9 @@ def run_single_backtest(model_name: str,
         max_short_exposure=CONFIG['max_short_exposure'],
         risk_premium=risk_premium,
         vrp_calculator=vrp_calculator,
-        vrp_method=CONFIG['vrp_method']
+        vrp_method=CONFIG['vrp_method'],
+        use_all_dte=CONFIG['use_all_dte'],
+        target_dte=CONFIG['target_dte']
     )
     engine.set_strategy(strategy)
 
@@ -161,9 +165,11 @@ def run_all_backtests() -> Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.Data
     # Load price and VIX data for VRP calculation
     print("\nLoading data for VRP calculation...")
     prices_df = pd.read_parquet(CONFIG['prices_path'])
-    vix_df = pd.read_parquet(CONFIG['vix_path'])
     prices_df['date'] = pd.to_datetime(prices_df['date'])
+
+    vix_df = pd.read_parquet(CONFIG['vix_path'])
     vix_df['date'] = pd.to_datetime(vix_df['date'])
+    vix_df = vix_df[(vix_df['date'] >= prices_df['date'].min()) & (vix_df['date'] <= prices_df['date'].max())]
     
     # Calculate log returns if not present
     if 'log_ret' not in prices_df.columns:
@@ -226,7 +232,7 @@ def run_all_backtests() -> Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.Data
     # XGBoost ML model - Pre-train on historical data before backtest period
     print("\nPre-training XGBoost model...")
     xgb_model = MLForecaster(pretrained=True)
-    xgb_model.pretrain(prices_df, cutoff_date=CONFIG['start_date'])
+    xgb_model.pretrain(prices_df, vix_df, cutoff_date=CONFIG['start_date'])
     
     results_df, engine, trade_log = run_single_backtest(
         'XGB', 
@@ -250,7 +256,8 @@ def run_all_backtests() -> Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.Data
 
 def calculate_performance_metrics(equity_curve: pd.Series, 
                                  expiry_log: pd.DataFrame = None,
-                                 initial_capital: float = 5000) -> Dict[str, float]:
+                                 initial_capital: float = 1000000,
+                                 risk_free_rate: float = 0.027) -> Dict[str, float]:
     """
     Calculate performance metrics for a backtest.
     
@@ -258,6 +265,7 @@ def calculate_performance_metrics(equity_curve: pd.Series,
         equity_curve: Series of portfolio equity over time
         expiry_log: DataFrame of option expirations with realized P&L
         initial_capital: Starting capital
+        risk_free_rate: Annual risk-free rate (default 2.7%)
         
     Returns:
         Dictionary with performance metrics
@@ -274,10 +282,11 @@ def calculate_performance_metrics(equity_curve: pd.Series,
     years = num_days / 252
     annualized_return = (1 + total_return) ** (1 / years) - 1
     
-    # Sharpe ratio
-    mean_daily_return = returns.mean()
+    # Sharpe ratio (excess returns over risk-free rate)
+    daily_rfr = risk_free_rate / 252  # Convert annual RFR to daily
+    mean_daily_excess_return = returns.mean() - daily_rfr
     std_daily_return = returns.std()
-    sharpe_ratio = (mean_daily_return / std_daily_return) * np.sqrt(252)
+    sharpe_ratio = (mean_daily_excess_return / std_daily_return) * np.sqrt(252)
     
     # Max drawdown
     running_max = equity_curve.expanding().max()
@@ -516,7 +525,6 @@ def save_results_to_csv(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngin
         - {model_name}_equity.csv: Equity curve for each model
         - {model_name}_expiry_log.csv: Expiry events for each model
         - {model_name}_iv_log.csv: Daily IV predictions for each model
-        - combined_results.csv: All equity curves in one file
         - combined_iv.csv: All IV predictions in one file
         
     Note: Trade logs are saved separately in trade_logs/ subdirectory 
@@ -526,7 +534,7 @@ def save_results_to_csv(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngin
     os.makedirs(output_dir, exist_ok=True)
     
     # Save metrics comparison
-    metrics_path = os.path.join(output_dir, 'metrics_comparison.csv')
+    metrics_path = os.path.join(output_dir, 'final_metrics.csv')
     metrics_df.to_csv(metrics_path)
     print(f"  Saved metrics to: {metrics_path}")
     
@@ -558,17 +566,6 @@ def save_results_to_csv(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngin
             iv_path = os.path.join(output_dir, f'IV_logs/{model_name}_iv_log.csv')
             iv_df.to_csv(iv_path, index=False)
             print(f"  Saved {model_name} IV log to: {iv_path}")
-    
-    # Save combined results (all equity curves in one file)
-    combined_df = pd.DataFrame()
-    for model_name, (results_df, _, _) in all_results.items():
-        if combined_df.empty:
-            combined_df['date'] = results_df['date']
-        combined_df[f'{model_name}_equity'] = results_df['equity'].values
-    
-    combined_path = os.path.join(output_dir, 'combined_results.csv')
-    combined_df.to_csv(combined_path, index=False)
-    print(f"  Saved combined results to: {combined_path}")
     
     # Save combined IV predictions (all models' IVs side-by-side with VIX)
     combined_iv_df = pd.DataFrame()
@@ -602,7 +599,7 @@ def save_results_to_csv(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngin
         except Exception as e:
             print(f"  Warning: Could not add VIX data to combined IV: {e}")
         
-        combined_iv_path = os.path.join(output_dir, 'combined_iv.csv')
+        combined_iv_path = os.path.join(output_dir, 'IV_logs/combined_iv.csv')
         combined_iv_df.to_csv(combined_iv_path, index=False)
         print(f"  Saved combined IV predictions to: {combined_iv_path}")
         append_vrp_to_combined_iv(combined_iv_path)
@@ -690,9 +687,9 @@ def main():
     # Generate plots
     print("\nStep 3: Generating visualizations...")
     plot_equity_curves(all_results, 
-                      save_path=f"{CONFIG['results_dir']}/equity_curves.png")
+                      save_path=f"{CONFIG['results_dir']}/plots/equity_curves.png")
     plot_iv_comparison(all_results,
-                      save_path=f"{CONFIG['results_dir']}/iv_comparison.png")
+                      save_path=f"{CONFIG['results_dir']}/plots/iv_comparison.png")
     
     # Save results to CSV
     print("\nStep 4: Saving results to CSV...")

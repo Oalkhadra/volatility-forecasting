@@ -1,20 +1,8 @@
-"""
-Core Backtesting Engine and Portfolio Management.
-
-This module handles:
-1. Portfolio state (Cash, Positions, Greeks)
-2. Daily time stepping through trading days
-3. Trade execution and accounting
-4. Option expiry handling
-5. Daily delta rebalancing
-"""
-
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass
 from typing import Dict, List, Optional
-from datetime import datetime, timedelta
-from dateutil.relativedelta import relativedelta
+from datetime import datetime
 import sys
 import os
 from tqdm import tqdm
@@ -226,7 +214,17 @@ class Portfolio:
                 
                 # Mark for removal
                 expired_keys.append(pos_key)
-        
+
+                # Log option expiry event
+                self.expiry_log.append({
+                    'date': current_date,
+                    'event': 'expiry',
+                    'position_key': pos_key,
+                    'entry_price': pos.entry_price,
+                    'exit_price': intrinsic,
+                    'quantity': pos.quantity,
+                    'pnl': pnl
+                })
         # Remove expired positions
         for key in expired_keys:
             del self.positions[key]
@@ -236,10 +234,11 @@ class Portfolio:
             self.expiry_log.append({
                 'date': current_date,
                 'event': 'expiry',
+                'position_key': 'Daily Expiry PnL',
                 'pnl': total_pnl,
                 'num_expired': len(expired_keys)
             })
-        
+
         return total_pnl
     
     def log_iv_prediction(self, date: datetime, implied_vol: float, underlying_price: float):

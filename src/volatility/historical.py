@@ -13,7 +13,6 @@ actually happens. Historical realized vol provides the "true" volatility.
 import numpy as np
 import pandas as pd
 from typing import Optional
-
 from pandas.io.stata import datetime
 
 
@@ -32,24 +31,7 @@ def calculate_realized_volatility(
     
     Returns:
         pandas Series of rolling volatility estimates
-        
-    Example:
-        >>> prices = pd.Series([100, 101, 99, 102, 98])
-        >>> rv = calculate_realized_volatility(prices, window=3)
-        >>> print(rv)
-        
-    TODO: Implement realized volatility calculation
-    
-    Hints for 'close' method:
-        1. Calculate log returns: ln(P_t / P_t-1)
-        2. Calculate rolling standard deviation of returns
-        3. Annualize: std * sqrt(252) for daily data
-        4. Handle NaNs at the start (first 'window' values)
-    
-    Interview Question: "Why use log returns instead of simple returns?"
-        Log returns are additive over time, symmetric, and more suitable
-        for statistical analysis. Also, Black-Scholes assumes log-normal
-        stock prices, which means log returns are normally distributed.
+
     """
     log_returns = np.log(prices / prices.shift(1))
     rolling_stdev = log_returns.rolling(window=window, min_periods=2).std()
@@ -63,8 +45,6 @@ def calculate_realized_volatility(
 class RollingVolCalculator:
     """
     Class to maintain rolling volatility calculations.
-    
-    Useful for backtesting - maintains state as new data arrives.
     """
     
     def __init__(self,  window: int = 30, annualize: bool = True):
@@ -99,29 +79,3 @@ class RollingVolCalculator:
             return stdev * np.sqrt(252)
         
         return stdev
-
-
-if __name__ == "__main__":
-    # Test your implementation
-    print("="*60)
-    print("REALIZED VOLATILITY TEST")
-    print("="*60)
-    
-    # Create test price series
-    np.random.seed(42)
-    n_days = 100
-    returns = np.random.normal(0, 0.02, n_days)  # 2% daily std
-    prices = 100 * np.exp(np.cumsum(returns))
-    prices_series = pd.Series(prices)
-    
-    # Calculate realized vol
-    rv = calculate_realized_volatility(prices_series, window=30)
-    
-    if rv is not None:
-        print(f"\nPrice range: ${prices_series.min():.2f} - ${prices_series.max():.2f}")
-        print(f"Realized vol (30-day): {rv.iloc[-1]:.2%}")
-        print(f"Expected ~20% annualized (2% daily * sqrt(252))")
-        print("\n✓ Function implemented!")
-    else:
-        print("\n❌ Not implemented yet - complete the TODO")
-
