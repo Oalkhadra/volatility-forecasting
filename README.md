@@ -228,11 +228,13 @@ IV_estimate = RV_forecast + VRP_adjustment
 - Rolling 252-day average for stable estimates
 - Regime-conditional: Different VRP by VIX level
 
-| Regime | VIX Level | Typical VRP |
+- For backtest, regime-based VRP was used, with the following values:
+
+| Regime | VIX Level | Mean VRP |
 |--------|-----------|-------------|
-| Low | < 15 | 3-5% |
-| Normal | 15-25 | 5-8% |
-| High | ≥ 25 | 8-15% |
+| Low | < 15 | 2.37% |
+| Normal | 15-25 | 3.32% |
+| High | ≥ 25 | 6.08% |
 
 ### Mispricing Detection
 
@@ -243,8 +245,8 @@ Mispricing % = (Market Price - Theoretical Price) / Theoretical Price
 ```
 
 **Trade Signals**:
-- **BUY** if mispricing < -50% (market significantly underpriced)
-- **SELL** if mispricing > +80% (market significantly overpriced)
+- **BUY** if market price < -50% of theoretical price (market significantly underpriced)
+- **SELL** if market price > +80% of theoretical (market significantly overpriced)
 
 *Asymmetric thresholds*: Selling has unlimited risk, so requires larger mispricing to compensate.
 
@@ -492,6 +494,8 @@ Key dependencies:
 - `scipy` for statistical tests and optimization
 - `matplotlib`, `plotly` for visualization
 
+Note: Options Data requires ThetaData Subscription
+
 ### Run Full Backtest
 
 ```bash
@@ -501,7 +505,6 @@ python main.py
 
 This will:
 1. Load all data (options, prices, VIX, rates)
-- Note: Options Data requires ThetaData Subscription
 2. Initialize VRP calculator
 3. Run backtests for all three volatility models
 4. Generate performance metrics and visualizations
