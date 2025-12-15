@@ -492,6 +492,8 @@ Key dependencies:
 - `scipy` for statistical tests and optimization
 - `matplotlib`, `plotly` for visualization
 
+Note: Options Data requires ThetaData Subscription
+
 ### Run Full Backtest
 
 ```bash
@@ -501,7 +503,6 @@ python main.py
 
 This will:
 1. Load all data (options, prices, VIX, rates)
-- Note: Options Data requires ThetaData Subscription
 2. Initialize VRP calculator
 3. Run backtests for all three volatility models
 4. Generate performance metrics and visualizations
