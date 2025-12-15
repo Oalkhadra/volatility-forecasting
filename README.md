@@ -245,8 +245,8 @@ Mispricing % = (Market Price - Theoretical Price) / Theoretical Price
 ```
 
 **Trade Signals**:
-- **BUY** if mispricing < -50% (market significantly underpriced)
-- **SELL** if mispricing > +80% (market significantly overpriced)
+- **BUY** if market price < -50% of theoretical price (market significantly underpriced)
+- **SELL** if market price > +80% of theoretical (market significantly overpriced)
 
 *Asymmetric thresholds*: Selling has unlimited risk, so requires larger mispricing to compensate.
 
