@@ -284,7 +284,7 @@ All strategies underperformed SPY buy-and-hold, with GARCH experiencing a catast
 
 XGBoost-based strategy saw huge options P&L upside, heavily suppressed by hedging costs
 
-![Equity Curves](results/backtest_analysis/costs_and_hedge_analysis.png)
+![Equity Curves](results/backtest_analysis/pnl_analysis.png)
 
 ### P&L Decomposition
 
