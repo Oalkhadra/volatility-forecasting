@@ -228,11 +228,13 @@ IV_estimate = RV_forecast + VRP_adjustment
 - Rolling 252-day average for stable estimates
 - Regime-conditional: Different VRP by VIX level
 
-| Regime | VIX Level | Typical VRP |
+- For backtest, regime-based VRP was used, with the following values:
+
+| Regime | VIX Level | Mean VRP |
 |--------|-----------|-------------|
-| Low | < 15 | 3-5% |
-| Normal | 15-25 | 5-8% |
-| High | ≥ 25 | 8-15% |
+| Low | < 15 | 2.37% |
+| Normal | 15-25 | 3.32% |
+| High | ≥ 25 | 6.08% |
 
 ### Mispricing Detection
 
