@@ -280,6 +280,12 @@ All strategies underperformed SPY buy-and-hold, with GARCH experiencing a catast
 
 ![Equity Curves](results/plots/equity_curves.png)
 
+### Complete P&L
+
+XGBoost-based strategy saw huge options P&L upside, heavily suppressed by hedging costs
+
+![Equity Curves](results/backtest_analysis/pnl_analysis.png)
+
 ### P&L Decomposition
 
 Based on $500,000 initial capital:
