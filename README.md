@@ -369,10 +369,10 @@ Despite XGB's highly significant superiority over GARCH in forecasting, the trad
 
 | Metric | Historical | GARCH | XGBoost |
 |--------|------------|-------|---------|
-| RMSE | 5.02 | 6.07 | 4.79 |
-| MAE | 3.89 | 5.24 | 4.15 |
-| Correlation | 0.62 | 0.10 | 0.60 |
-| Spearman | 0.65 | 0.04 | 0.62 |
+| RMSE | 5.02 | 6.07 | **4.79** |
+| MAE | **3.89** | 5.24 | 4.15 |
+| Correlation | **0.62** | 0.10 | 0.60 |
+| Spearman | **0.65** | 0.04 | 0.62 |
 | QLIKE Loss | 0.146 | 0.170 | **0.116** |
 
 ### Diebold-Mariano Test Results
@@ -388,7 +388,7 @@ GARCH vs Naive:      DM = +0.62,  p = 0.538  (No significant difference)
 XGBoost vs GARCH:    DM = -2.85,  p = 0.004  (XGBoost significantly better) ✓
 ```
 
-**Interpretation**: XGBoost's outperformance over GARCH is robust (>99% confidence), but neither sophisticated model significantly beats naive historical volatility at forecasting.
+**Interpretation**: XGBoost's outperformance over GARCH is robust (>99% confidence), but neither sophisticated model significantly differs from istorical volatility at forecasting accuracy.
 
 ### Regime-Conditional Performance
 
