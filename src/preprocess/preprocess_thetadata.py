@@ -9,7 +9,7 @@ Downloads historical EOD options data from ThetaData with:
 Uses /v3/option/history/eod endpoint for historical data (Value tier).
 API Reference: https://docs.thetadata.us/operations/option_history_eod.html
 
-Note: IV is not included (requires Standard tier). Use separate notebook to calculate IV.
+Note: IV is not included (requires Standard tier). Using preprocess_volatility.py to calculate IV.
 """
 
 import httpx
@@ -19,21 +19,13 @@ import yfinance as yf
 from io import StringIO
 from datetime import datetime, timedelta
 from pathlib import Path
-import sys
 from dateutil.relativedelta import relativedelta
 from calendar import monthrange
-
-# Add parent for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from pricing.risk_free_rate import get_risk_free_rate
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
+from risk_free_rate import get_risk_free_rate
 
 # Date range for options data
 START = '2020-01-01'
-END = '2025-11-30'  # Adjust to your desired end date
+END = '2025-11-30'
 
 # ThetaData terminal connection
 THETA_HOST = "localhost"
@@ -43,14 +35,7 @@ BASE_URL = f"http://{THETA_HOST}:{THETA_PORT}"
 # Output directory
 OUTPUT_RAW = "data/raw"
 OUTPUT_DIR = "data/processed"
-
-# Ticker to process
 TICKER = "SPY"
-
-
-# =============================================================================
-# DATE UTILITIES
-# =============================================================================
 
 def generate_month_ranges(start_date: str, end_date: str):
     """
@@ -66,19 +51,19 @@ def generate_month_ranges(start_date: str, end_date: str):
     start_dt = datetime.strptime(start_date, '%Y-%m-%d')
     end_dt = datetime.strptime(end_date, '%Y-%m-%d')
     
-    current_dt = start_dt.replace(day=1)  # Start at beginning of month
+    current_dt = start_dt.replace(day=1)
     
     while current_dt <= end_dt:
         year = current_dt.year
         month = current_dt.month
         
-        # First day of month (or start_date if in first month)
+        # First day of month or start_date
         if current_dt.year == start_dt.year and current_dt.month == start_dt.month:
             month_start = start_dt
         else:
             month_start = current_dt
         
-        # Last day of month (or end_date if in last month)
+        # Last day of month or end_date
         last_day = monthrange(year, month)[1]
         month_end = current_dt.replace(day=last_day)
         if month_end > end_dt:
@@ -89,11 +74,7 @@ def generate_month_ranges(start_date: str, end_date: str):
         # Move to next month
         current_dt += relativedelta(months=1)
 
-
-# =============================================================================
-# THETADATA FUNCTIONS
-# =============================================================================
-
+# ThetaData Functions
 def fetch_options_eod(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
     """
     Fetch historical EOD options data from ThetaData.
@@ -159,7 +140,6 @@ def fetch_options_eod(symbol: str, start_date: str, end_date: str) -> pd.DataFra
     print(f"  ✓ Total: {len(combined):,} raw option records")
     return combined
 
-
 def process_raw_options(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     """
     Transform raw ThetaData EOD response into clean format.
@@ -198,10 +178,7 @@ def process_raw_options(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     return df
 
 
-# =============================================================================
-# YFINANCE FUNCTIONS
-# =============================================================================
-
+# Yahoo Finance Functions
 def get_underlying_prices(ticker: str, start_date: str, end_date: str, full_history: bool = False) -> pd.DataFrame:
     """Download underlying price data from Yahoo Finance.
     
@@ -246,10 +223,10 @@ def get_underlying_prices(ticker: str, start_date: str, end_date: str, full_hist
     return df
 
 
-def get_vix_data(start_date: str, end_date: str) -> pd.DataFrame:
+def get_vix_data() -> pd.DataFrame:
     """Download VIX data from Yahoo Finance."""
     print(f"  Downloading VIX data...")
-    df = yf.download("^VIX", period="max", auto_adjust=False)
+    df = yf.download("^VIX", period="max", auto_adjust=False) # Get all historical VIX data
     
     if df.empty:
         return pd.DataFrame()
@@ -270,10 +247,7 @@ def get_vix_data(start_date: str, end_date: str) -> pd.DataFrame:
     return df
 
 
-# =============================================================================
-# DATA ENRICHMENT
-# =============================================================================
-
+# Data Wrangling Functions
 def merge_underlying_prices(options_df: pd.DataFrame, prices_df: pd.DataFrame) -> pd.DataFrame:
     """Merge underlying close price by date from yfinance."""
     print("  Merging underlying prices from yfinance...")
@@ -299,7 +273,6 @@ def merge_underlying_prices(options_df: pd.DataFrame, prices_df: pd.DataFrame) -
     print(f"    ✓ Merged {len(options_df):,} records")
     return options_df
 
-
 def merge_risk_free_rate(options_df: pd.DataFrame, rf_df: pd.DataFrame) -> pd.DataFrame:
     """Merge risk-free rate by date."""
     print("  Merging risk-free rates...")
@@ -314,11 +287,7 @@ def merge_risk_free_rate(options_df: pd.DataFrame, rf_df: pd.DataFrame) -> pd.Da
     
     return options_df
 
-
-# =============================================================================
-# DATA FILTERING
-# =============================================================================
-
+# Data Filtering Functions
 def apply_filters(df: pd.DataFrame, min_dte: int = 1, max_dte: int = 30) -> pd.DataFrame:
     """
     Apply liquidity and quality filters.
@@ -336,7 +305,7 @@ def apply_filters(df: pd.DataFrame, min_dte: int = 1, max_dte: int = 30) -> pd.D
     # DTE filter
     df = df[(df['days_to_expiry'] >= min_dte) & (df['days_to_expiry'] <= max_dte)].copy()
     
-    # Check if bid/ask are available
+    # Check for bid/ask availability
     has_quotes = 'bid' in df.columns and 'ask' in df.columns
     
     if has_quotes and df['bid'].notna().any():
@@ -361,7 +330,7 @@ def apply_filters(df: pd.DataFrame, min_dte: int = 1, max_dte: int = 30) -> pd.D
         df['spread_pct'] = np.nan
         df = df[df['mid_price'] > 0.10].copy()
     
-    # Arbitrage filter: price must exceed intrinsic value
+    # No Arbitrage filter
     intrinsic = np.where(
         df['call_put'] == 'call',
         np.maximum(df['underlying_price'] - df['strike'], 0),
@@ -380,11 +349,7 @@ def apply_filters(df: pd.DataFrame, min_dte: int = 1, max_dte: int = 30) -> pd.D
     
     return df
 
-
-# =============================================================================
-# MAIN PIPELINE
-# =============================================================================
-
+# Main Pipeline
 def process_month(
     symbol: str,
     year: int,
@@ -519,8 +484,7 @@ def download_and_process(
     print(f"{'='*70}")
     prices_df = get_underlying_prices(symbol, start_date, end_date, full_history=True)
     rf_df = get_risk_free_rate(start_date, end_date)
-    
-    # Save these once
+
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
@@ -580,11 +544,6 @@ def download_and_process(
         'total_processed': total_processed
     }
 
-
-# =============================================================================
-# DATA LOADING UTILITIES
-# =============================================================================
-
 def load_monthly_data(
     symbol: str,
     start_date: str,
@@ -636,19 +595,19 @@ def load_monthly_data(
 
 if __name__ == "__main__":
     # Process options monthly
-    # summary = download_and_process(
-    #     symbol=TICKER,
-    #     start_date=START,
-    #     end_date=END,
-    #     output_dir=OUTPUT_DIR,
-    #     skip_existing=True  # Set to False to re-download existing months
-    # )
+    summary = download_and_process(
+        symbol=TICKER,
+        start_date=START,
+        end_date=END,
+        output_dir=OUTPUT_DIR,
+        skip_existing=True  # Set to False to re-download existing months
+    )
     
     # Also download VIX
     print(f"\n{'='*70}")
     print("Downloading VIX data...")
     print(f"{'='*70}")
-    vix_df = get_vix_data(START, END)
+    vix_df = get_vix_data()
     if not vix_df.empty:
         vix_file = Path(OUTPUT_DIR) / "vix_data.parquet"
         vix_df.to_parquet(vix_file, compression='snappy', index=False)

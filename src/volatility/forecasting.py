@@ -1,16 +1,3 @@
-"""
-Strategy D: Volatility Forecasting Models
-
-This module implements two forecasting approaches:
-- GARCH(1,1): Classical econometric forecasting (industry standard)
-- XGBoost ML: Modern machine learning approach
-
-Comparison: Traditional parametric (GARCH) vs non-parametric (ML)
-
-The hypothesis: Statistical forecasting models predict realized vol better
-than naive historical averages or the market's implied vol.
-"""
-
 import numpy as np
 import pandas as pd
 import xgboost as xgb
@@ -28,11 +15,7 @@ class GARCHForecaster:
         α = reaction to recent shocks (ARCH term)
         β = persistence of variance (GARCH term)
         α + β < 1 for stationarity
-        
-    GARCH captures:
-    - Volatility clustering (high vol follows high vol)
-    - Mean reversion (vol returns to long-run average)
-    - Fat tails in return distribution
+
     """
     
     def __init__(self):
@@ -48,7 +31,7 @@ class GARCHForecaster:
         Fit GARCH(1,1) model to return series.
         
         Args:
-            returns: pandas Series of returns (typically log returns)
+            returns: pandas Series of returns
             
         Estimates parameters ω, α, β by maximum likelihood.
 
@@ -99,17 +82,7 @@ class GARCHForecaster:
 class MLForecaster:
     """
     Machine Learning volatility forecaster using XGBoost.
-    
-    Uses gradient boosting to predict future realized volatility based on:
-    - Lagged realized volatilities (multiple windows)
-    - Recent returns (momentum/reversal)
-    - Higher moments (skew, kurtosis)
-    - GARCH forecast (as a feature)
-    
-    This captures non-linear relationships and interactions that 
-    parametric models like GARCH might miss.
-    
-    Supports pre-training on historical data for faster backtesting.
+
     """
     
     def __init__(self, pretrained: bool = False):
@@ -120,7 +93,7 @@ class MLForecaster:
             pretrained: If True, model expects to be pretrained before backtest.
                        This skips daily retraining in update_vol_model().
         """
-        self.model = xgb.XGBRegressor(
+        self.model = xgb.XGBRegressor( # Parameters have been fine-tuned through OOS train/test data in notebooks/xgboost_development.ipynb
             n_estimators=300,
             max_depth=3,
             learning_rate=0.01,
@@ -129,7 +102,7 @@ class MLForecaster:
         )
         
         self.is_fitted = False
-        self.pretrained = pretrained  # Skip daily retraining if True
+        self.pretrained = pretrained  # Skip daily retraining if True for efficient backtesting
         self.feature_names = []
         self.scaler = None  # For feature scaling if needed
         self._last_returns = None  # Store returns for forecasting
@@ -139,15 +112,10 @@ class MLForecaster:
         returns = returns.reset_index(drop=True)
         vix = vix.reset_index(drop=True)
 
-
-        # ===========================================
         # Lagged VIX
-        # ===========================================
         yesterday_vix = vix.shift(1)
 
-        # ===========================================
-        # REALIZED VOLATILITY FEATURES
-        # ===========================================
+        # Historical realized volatility
         rv_1d = (np.abs(returns) * np.sqrt(252)).shift(1)            # Yesterday's |return|
         rv_5d = (returns.rolling(5).std() * np.sqrt(252)).shift(1)   # Past 5 days (t-5 to t-1)
         rv_22d = (returns.rolling(22).std() * np.sqrt(252)).shift(1) # Past 22 days (t-22 to t-1)
@@ -156,26 +124,16 @@ class MLForecaster:
         rv_120d = (returns.rolling(120).std() * np.sqrt(252)).shift(1) # Past 120 days (t-120 to t-1)
 
 
-        # ===========================================
-        # LEVERAGE EFFECT (Black 1976)
-        # ===========================================
-        ret_1d = returns.shift(1)  # Yesterday's return
-        ret_22d = returns.rolling(22).sum().shift(1) # Cumulative return t-22 to t-1
-        ret_30d = returns.rolling(30).sum().shift(1) # Cumulative return t-30 to t-1
-        ret_60d = returns.rolling(60).sum().shift(1) # Cumulative return t-60 to t-1
-        ret_120d = returns.rolling(120).sum().shift(1) # Cumulative return t-120 to t-1
-        
-        # ===========================================
-        # ASYMMETRIC/SIGNED VOLATILITY (Patton & Sheppard 2015)
-        # ===========================================
-        neg_returns = returns.clip(upper=0)  # Negative returns only
-        
-        # Realized semivariance: sqrt(sum(r^2)) * sqrt(252) / 100
+        # Historical returns
+        ret_1d = returns.shift(1)                       # Yesterday's return
+        ret_22d = returns.rolling(22).sum().shift(1)    # Cumulative return t-22 to t-1
+        ret_30d = returns.rolling(30).sum().shift(1)    # Cumulative return t-30 to t-1
+        ret_60d = returns.rolling(60).sum().shift(1)    # Cumulative return t-60 to t-1
+        ret_120d = returns.rolling(120).sum().shift(1)  # Cumulative return t-120 to t-1
+
+        neg_returns = returns.clip(upper=0)
         rsv_neg_5d = (np.sqrt((neg_returns**2).rolling(5).sum()) * np.sqrt(252)).shift(1)
 
-        # ===========================================
-        # BUILD DATAFRAME
-        # ===========================================
         df = pd.DataFrame({
             'yesterday_vix': yesterday_vix,
             'rv_1d': rv_1d,
@@ -201,7 +159,7 @@ class MLForecaster:
         
         return df
 
-    def _create_targets(self, returns: pd.Series, lookback: int = 30, horizon: int = 7) -> np.ndarray:
+    def _create_targets(self, returns: pd.Series, lookback: int = 30, horizon: int = 30) -> np.ndarray:
         """
         Create target vector: forward-looking realized vol.
         
@@ -218,38 +176,48 @@ class MLForecaster:
         rolling_vol = returns.rolling(window=horizon).std() * np.sqrt(252)
         
         # 2. Shift BACKWARDS so that the value at time t represents the vol
-        # realized over the *next* 'horizon' days (t to t+horizon)
         targets = rolling_vol.shift(-horizon)
         
         # 3. Slice to match the feature generation
-        # Features start at 'lookback', so targets must also start there
-        # We drop the NaNs at the end created by the shift
         target_slice = targets.iloc[lookback : -horizon]
         
         return target_slice.values
     
-    def fit(self, returns: pd.Series, vix: pd.Series, min_train_size = 30, horizons = [30]) -> None:
+    def create_feature_targets(self, returns: pd.Series, vix: pd.Series, lookback: int = 30, horizon: int = 30):
+        # 1. Create Features and Targets for each horizon
+        all_X, all_y = [], []
+        
+        X = self._create_features(returns, vix, lookback=lookback, horizon=horizon)
+        y = self._create_targets(returns, lookback=lookback, horizon=horizon)
+        
+        # Align X and y: targets are shorter because they need forward data
+        n_samples = len(y)
+        if n_samples > 0:
+            X = X.iloc[:n_samples]
+            all_X.append(X)
+            all_y.append(y)
+        
+        if len(all_X) == 0:
+            raise ValueError("Not enough data to create training samples")
+        
+        X_combined = pd.concat(all_X, ignore_index=True)
+        y_combined = np.concatenate(all_y)
+        
+        mask = ~(X_combined.isna().any(axis=1) | np.isnan(y_combined))
+        X_combined = X_combined[mask]
+        y_combined = y_combined[mask]
+
+        return X_combined, y_combined
+
+    def fit(self, returns: pd.Series, vix: pd.Series, lookback: int = 30, min_train_size = 30, horizon: int = 30) -> None:
         """
         Fit ML model to return series.
-        
-        Uses all available data to train. For walk-forward validation,
-        call this method with expanding window in backtesting loop.
-        
+
         Args:
             returns: Historical returns
             vix: Historical VIX
             min_train_size: Minimum returns needed to fit
-                    
-        Hints:
-            1. Create features for each time period
-            2. Create targets (forward realized vol)
-            3. Remove NaN rows
-            4. Split into train/validation if desired (optional)
-            5. Fit XGBoost model
-            6. Set self.is_fitted = True
-            
-        Note: For backtesting, you'll call fit() with expanding window
-        each week to ensure no lookahead bias.
+
         """
         # If pretrained and already fitted, just update the returns cache
         if self.pretrained and self.is_fitted:
@@ -264,34 +232,10 @@ class MLForecaster:
         self._last_returns = returns.copy()
         self._last_vix = vix.copy()
         
-        # 1. Create Features and Targets
-        all_X, all_y = [], []
-        for h in horizons:
-            X = self._create_features(returns, vix, horizon=h)
-            y = self._create_targets(returns, horizon=h)
-            
-            # Align X and y: targets are shorter because they need forward data
-            # X has (n - lookback) rows, y has (n - lookback - horizon) rows
-            # Trim X from the end to match y
-            n_samples = len(y)
-            if n_samples > 0:
-                X = X.iloc[:n_samples]
-                all_X.append(X)
-                all_y.append(y)
-        
-        if len(all_X) == 0:
-            raise ValueError("Not enough data to create training samples")
-        
-        X_combined = pd.concat(all_X, ignore_index=True)
-        y_combined = np.concatenate(all_y)
-        
-        # Remove rows with NaN values
-        mask = ~(X_combined.isna().any(axis=1) | np.isnan(y_combined))
-        X_combined = X_combined[mask]
-        y_combined = y_combined[mask]
+        X_combined, y_combined = self.create_feature_targets(returns, vix, lookback=lookback, horizon=horizon)
         
         if len(X_combined) == 0:
-            raise ValueError("All training samples contain NaN values")
+            raise ValueError("Not enough data to create training samples")
         
         self.model.fit(X_combined, y_combined)
         self.is_fitted = True
@@ -299,20 +243,19 @@ class MLForecaster:
         # Save feature names for later importance plotting
         self.feature_names = X_combined.columns.tolist()
         
-        print(f"  MLForecaster trained on {len(X_combined)} samples across {len(horizons)} horizons")
+        print(f"  MLForecaster trained on {len(X_combined)} samples")
     
-    def pretrain(self, prices_df: pd.DataFrame, vix_df: pd.Series, cutoff_date, horizons = [30]) -> None:
+    def pretrain(self, prices_df: pd.DataFrame, vix_df: pd.Series, cutoff_date, lookback: int = 30, horizon: int = 30) -> None:
         """
         Pre-train the model on historical data before a cutoff date.
         
-        This avoids look-ahead bias by only using data before the backtest starts.
-        After pretraining, daily calls to fit() will only update the returns cache
-        for forecasting, not retrain the model.
+        Avoiding look-ahead bias by only using data before the backtest, and training on a large pre-backtest dataset.
+        After pretraining, daily calls to fit() will only update the returns cache for forecasting, not retrain the model.
         
         Args:
             prices_df: DataFrame with 'date' and 'log_ret' columns
             cutoff_date: Train only on data before this date (typically backtest start)
-            horizons: List of forecast horizons to train on
+            horizon: Forecast horizon
         """
         print(f"Pre-training MLForecaster on data before {cutoff_date}...")
         
@@ -330,10 +273,10 @@ class MLForecaster:
         
         # Mark as pretrained so future fit() calls just update returns cache
         self.pretrained = True
-        self.is_fitted = False  # Temporarily unset so fit() actually trains
+        self.is_fitted = False
         
         # Train the model
-        self.fit(returns, vix, horizons=horizons)
+        self.fit(returns, vix, lookback=lookback, horizon=horizon)
         
         # Now mark as pretrained
         self.pretrained = True
@@ -344,7 +287,7 @@ class MLForecaster:
         Create features for ONLY the most recent timestamp (optimized for forecasting).
         
         This matches the exact feature format from _create_features() but only
-        computes for the current time point (much faster for forecasting).
+        computes for the current time point.
         
         Args:
             returns: Return series (needs at least 120 values for all features)
@@ -357,14 +300,10 @@ class MLForecaster:
         if len(returns) < 120:
             raise ValueError("Need at least 120 returns to create features")
         
-        # ===========================================
-        # Lagged VIX (yesterday's VIX)
-        # ===========================================
+        # Lagged VIX
         yesterday_vix = vix.iloc[-1]
         
-        # ===========================================
-        # REALIZED VOLATILITY FEATURES
-        # ===========================================
+        # Historical realized volatility
         rv_1d = np.abs(returns.iloc[-1]) * np.sqrt(252)  # Yesterday's |return|
         rv_5d = returns.iloc[-5:].std() * np.sqrt(252)   # Past 5 days
         rv_22d = returns.iloc[-22:].std() * np.sqrt(252) # Past 22 days
@@ -372,24 +311,16 @@ class MLForecaster:
         rv_60d = returns.iloc[-60:].std() * np.sqrt(252) # Past 60 days
         rv_120d = returns.iloc[-120:].std() * np.sqrt(252) # Past 120 days
         
-        # ===========================================
-        # LEVERAGE EFFECT (Black 1976)
-        # ===========================================
+        # Historical returns
         ret_1d = returns.iloc[-1]  # Yesterday's return
         ret_22d = returns.iloc[-22:].sum()  # Cumulative return last 22 days
         ret_30d = returns.iloc[-30:].sum()  # Cumulative return last 30 days
         ret_60d = returns.iloc[-60:].sum()  # Cumulative return last 60 days
         ret_120d = returns.iloc[-120:].sum()  # Cumulative return last 120 days
         
-        # ===========================================
-        # ASYMMETRIC/SIGNED VOLATILITY (Patton & Sheppard 2015)
-        # ===========================================
-        neg_returns = returns.iloc[-5:].clip(upper=0)  # Negative returns only (last 5 days)
+        neg_returns = returns.iloc[-5:].clip(upper=0)
         rsv_neg_5d = np.sqrt((neg_returns**2).sum()) * np.sqrt(252)
         
-        # ===========================================
-        # BUILD DATAFRAME (same column order as _create_features)
-        # ===========================================
         features = {
             'yesterday_vix': yesterday_vix,
             'rv_1d': rv_1d,
@@ -420,7 +351,7 @@ class MLForecaster:
             horizon: Forecast horizon in days (default 30)
             
         Returns:
-            Forecasted annualized volatility for next 'horizon' days (decimal, e.g., 0.15 for 15%)
+            Forecasted annualized volatility 
 
         """
         if not self.is_fitted:
@@ -455,8 +386,7 @@ class MLForecaster:
         """
         if not self.is_fitted:
             raise ValueError("Must call fit() first")
-        
-        # XGBoost has built-in feature importance
+
         importance = self.model.feature_importances_
         
         return pd.DataFrame({
@@ -465,12 +395,10 @@ class MLForecaster:
         }).sort_values('importance', ascending=False)
 
 
-# Comparison and helper functions
-
+# Helper function (Custom Loss Function)
 def asymmetric_squared_error(y_true, y_pred):
     """
-    Custom XGBoost objective that penalizes underprediction more.
-    Underpredicting vol → theo too low → sell signals → dangerous short positions.
+    Custom XGBoost objective that penalizes underprediction slightly more.
     
     Args:
         y_true: Actual forward RV
@@ -483,50 +411,10 @@ def asymmetric_squared_error(y_true, y_pred):
     under_weight = 1.2
     over_weight = 1.0
     
-    residual = y_pred - y_true  # Positive = overprediction, Negative = underprediction
-    
+    residual = y_pred - y_true
     weights = np.where(residual < 0, under_weight, over_weight)
     
     grad = weights * residual
     hess = weights * np.ones_like(residual)
     
     return grad, hess
-
-def calculate_forecast_accuracy(
-    forecasts: pd.Series,
-    actuals: pd.Series
-) -> dict:
-    """
-    Calculate accuracy metrics for vol forecasts.
-    
-    Args:
-        forecasts: Forecasted volatilities
-        actuals: Actual realized volatilities
-        
-    Returns:
-        Dictionary with accuracy metrics
-        
-    TODO: OPTIONAL - For Phase 5 analysis
-    """
-    # Remove NaN values
-    mask = ~(forecasts.isna() | actuals.isna())
-    f = forecasts[mask]
-    a = actuals[mask]
-    
-    # Calculate metrics
-    rmse = np.sqrt(np.mean((f - a)**2))
-    mae = np.mean(np.abs(f - a))
-    correlation = np.corrcoef(f, a)[0, 1]
-    
-    # Directional accuracy (did we predict high/low correctly?)
-    median_vol = a.median()
-    correct_direction = ((f > median_vol) == (a > median_vol)).sum()
-    hit_rate = correct_direction / len(a)
-    
-    return {
-        'RMSE': rmse,
-        'MAE': mae,
-        'Correlation': correlation,
-        'Hit_Rate': hit_rate,
-        'N_Observations': len(a)
-    }

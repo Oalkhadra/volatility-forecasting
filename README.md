@@ -31,9 +31,9 @@ This project implements a complete backtesting framework to evaluate how differe
 
 | Model | Total Return | Ann. Return | Sharpe Ratio | Max Drawdown | Win Rate |
 |-------|-------------|-------------|--------------|--------------|----------|
-| **XGB** | +13.06% | +2.15% | -0.06 | -17.01% | 63.0% |
-| Historical | -3.22% | -0.56% | -0.48 | -14.87% | 34.8% |
-| GARCH | -35.63% | -7.34% | -1.34 | -40.92% | 6.2% |
+| **XGB** | +14.59% | +2.39% | -0.03 | -16.74% | 61.1% |
+| Historical | -3.33% | -0.58% | -0.48 | -15.46% | 32.1% |
+| GARCH | -32.63% | -6.61% | -1.24 | -38.12% | 14.3% |
 
 ---
 
@@ -276,7 +276,7 @@ Hedge shares = -Option contracts × Delta × 100
 
 ### Equity Curves
 
-All strategies underperformed SPY buy-and-hold, with GARCH experiencing a catastrophic 40% drawdown during the 2022 volatility regime.
+All strategies underperformed SPY buy-and-hold, with GARCH experiencing a catastrophic 38% drawdown during the 2022 volatility regime.
 
 ![Equity Curves](results/plots/equity_curves.png)
 
@@ -286,9 +286,9 @@ Based on $500,000 initial capital:
 
 | Strategy | Total Return | **Net P&L** |
 |----------|-------------|-------------|
-| **XGB** | +13.06% | **~+$65,000** |
-| Historical | -3.22% | **~-$16,000** |
-| GARCH | -35.63% | **~-$178,000** |
+| **XGB** | +14.59% | **~+$73,000** |
+| Historical | -3.33% | **~-$17,000** |
+| GARCH | -32.63% | **~-$163,000** |
 
 **Critical Insight from Analysis**: The results exploration notebook reveals that XGBoost generated substantial *option-only* P&L, but delta hedging in a trending market destroyed significant gains. This is the "hedge drag" problem—continuously shorting stock (to hedge short puts) as the market rallies loses money on the hedge leg. Run the `results_exploration.ipynb` notebook to see the full P&L waterfall breakdown by strategy.
 
@@ -296,22 +296,20 @@ Based on $500,000 initial capital:
 
 | Strategy | Total Trades | Puts | Calls | Buys | Sells |
 |----------|-------------|------|-------|------|-------|
-| XGB | 2,064 | 62% | 38% | 26% | 74% |
-| GARCH | 614 | 89% | 11% | 98% | 2% |
-| Historical | 1,292 | 56% | 44% | 31% | 69% |
+| XGB | 1,682 | 63% | 37% | 40% | 60% |
+| GARCH | 1,919 | 10% | 90% | 75% | 25% |
+| Historical | 1,634 | 24% | 76% | 65% | 35% |
 
-**XGB was heavily biased toward selling puts (short volatility)**—which works well in rising markets but carries significant tail risk. GARCH was almost exclusively buying puts, essentially paying for insurance that rarely paid off.
+**XGB was more balanced but biased toward selling options (60% sells)**—primarily puts, which works well in rising markets but carries tail risk. GARCH and Historical were predominantly buying calls, essentially paying for upside exposure that often expired worthless.
 
 ### Win Rates by Trade Type
 
-| Category | XGB | GARCH | Historical |
-|----------|-----|-------|------------|
-| Buy Call | 50.5% | 0.0% | 46.5% |
-| Sell Call | 80.5% | 50.0% | 78.5% |
-| Buy Put | 23.9% | 6.3% | 22.9% |
-| **Sell Put** | **74.1%** | 0.0% | 45.8% |
+Win rates vary significantly by strategy and trade type. Run the `results_exploration.ipynb` notebook to see the detailed 4-way breakdown (Buy/Sell × Call/Put) with current results.
 
-XGB's edge came from **selling puts** with a 74% win rate—consistent with harvesting the variance risk premium in a bull market.
+**Key patterns observed**:
+- XGB's selling bias (60% sells) captures variance risk premium more effectively
+- GARCH and Historical's heavy call buying (75-90%) suffered in periods of declining implied volatility
+- Sell strategies generally outperformed buy strategies across all models
 
 ---
 
@@ -332,16 +330,16 @@ Delta hedging is theoretically necessary for isolating volatility exposure, but 
 
 *Implication*: Consider alternative hedge schedules (weekly rebalancing, delta bands, or dynamic hedge ratios based on market regime). Pure delta-neutrality may be too expensive.
 
-### 3. Short Volatility Dominates in Bull Markets
+### 3. Selling Options Dominates in Bull Markets
 
-XGB's heavy put-selling bias was extremely profitable on a per-trade basis (74% win rate on sold puts). This is effectively harvesting the variance risk premium—compensation for bearing tail risk.
+XGB's selling bias (60% of trades) was more profitable than the buying-heavy approaches of GARCH (75% buys) and Historical (65% buys). This is effectively harvesting the variance risk premium—compensation for bearing tail risk.
 
-*Implication*: The strategy's success depends heavily on market regime. In a prolonged bear market or volatility spike (2008, March 2020), this approach would face massive losses. Consider regime-based position sizing or tail hedges.
+*Implication*: The strategy's success depends heavily on market regime. In a prolonged bear market or volatility spike (2008, March 2020), short volatility approaches would face massive losses. Consider regime-based position sizing or tail hedges.
 
 ### 4. GARCH Fails Spectacularly
 
-GARCH's 40% drawdown and 6% win rate reveal a systematic failure mode: its mean-reverting forecasts consistently undershoot during sustained high-volatility periods. This led to:
-- Overvaluing puts (buying insurance at inflated prices)
+GARCH's 38% drawdown and 14% win rate reveal a systematic failure mode: its mean-reverting forecasts consistently undershoot during sustained high-volatility periods. This led to:
+- Heavy call buying (90% of trades were calls) at inflated prices
 - Missing selling opportunities (theoretical prices too low)
 - Catastrophic losses during 2022's volatility crush
 

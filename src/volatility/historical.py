@@ -1,15 +1,3 @@
-"""
-Strategy B: Historical Realized Volatility
-
-This module calculates historical realized volatility using different methods:
-- Close-to-close returns (standard)
-- Parkinson estimator (uses high-low)
-- Garman-Klass estimator (uses OHLC)
-
-The hypothesis: Market systematically misprices options relative to what 
-actually happens. Historical realized vol provides the "true" volatility.
-"""
-
 import numpy as np
 import pandas as pd
 from typing import Optional

@@ -1,23 +1,18 @@
 import sys
 import os
-
-# Add parent directory (src/) to path for absolute imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
 from typing import Dict, Tuple
+
+# Add parent directory (src/) to path for absolute imports
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from backtest.engine import BacktestEngine
 from backtest.strategy import MispricingStrategy
 from volatility.forecasting import GARCHForecaster, MLForecaster
 from volatility.historical import RollingVolCalculator
 from volatility.vrp import VarianceRiskPremiumCalculator
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
 
 CONFIG = {
     # Data paths
@@ -36,8 +31,8 @@ CONFIG = {
     'sell_threshold': 0.80,        # 80% overpriced to sell (mispricing > +80%)
     'exit_threshold_buy': 0.25,    # Exit position if mispricing within 25% of fair value
     'exit_threshold_sell': 0.25,   # Exit position if mispricing within 25% of fair value
-    'max_positions': 21,
-    'contracts_per_trade': 2,     # Max contracts per trade (will be reduced if needed)
+    'max_positions': 21,           # Max number of positions in portfolio (Including hedge)
+    'contracts_per_trade': 2,      # Max contracts per trade (will be reduced if needed)
     
     # Risk management parameters
     'max_leverage': 1,            # Max total capital usage / equity ratio
@@ -48,18 +43,11 @@ CONFIG = {
     'historical_window': 30,  # 30-day rolling window
     
     # Variance Risk Premium (VRP) parameters
-    'use_vrp_calculator': True,   # Use empirical VRP instead of fixed premium
+    'use_vrp_calculator': True,   # Use regime-based VRP
     'vrp_rv_window': 30,          # Window for realized vol in VRP calculation
-    'vrp_lookback': 252,          # Lookback for rolling VRP average (1 year)
-    'vrp_method': 'regime',      # VRP method: 'rolling', 'regime', or 'regime_rolling'
-    'vrp_use_regime': True,       # Estimate separate VRP by regime
     
-    # Legacy: Fixed risk premium (only used if use_vrp_calculator=False)
-    'risk_premium_fallback': 0.1,
-    
-    # DTE filtering
-    'use_all_dte': False,          # If True, trade all DTEs (1-120). If False, use target_dte
-    'target_dte': 30,             # Specific DTE to trade when use_all_dte=False
+    # DTE targeting
+    'target_dte': 30,             # Fixed DTE to trade (e.g., 30-day options)
     
     # Output
     'results_dir': 'results',
@@ -67,33 +55,21 @@ CONFIG = {
     'save_data': True
 }
 
-# ============================================================================
-# BACKTEST EXECUTION
-# ============================================================================
-
+# Backtest Functions
 def run_single_backtest(model_name: str, 
                        vol_model,
-                       vrp_calculator: VarianceRiskPremiumCalculator = None,
-                       risk_premium: float = 0.0) -> Tuple[pd.DataFrame, BacktestEngine]:
+                       vrp_calculator: VarianceRiskPremiumCalculator = None) -> Tuple[pd.DataFrame, BacktestEngine]:
     """
     Run backtest for a single volatility model.
     
     Args:
-        model_name: Name of the model (for logging)
+        model_name: Name of the model
         vol_model: Volatility model instance
-        vrp_calculator: VRP calculator for empirical VRP adjustment (preferred)
-        risk_premium: Legacy fixed variance risk premium (used if vrp_calculator is None)
+        vrp_calculator: VRP calculator for regime-based VRP adjustment
  
     Returns:
         Tuple of (results_df, engine, trade_log)
 
-    Steps:
-        1. Create BacktestEngine instance
-        2. Load data (options, prices, rates)
-        3. Create MispricingStrategy with vol_model and VRP calculator
-        4. Attach strategy to engine
-        5. Run backtest
-        6. Return results
 
     """
     print(f"\n{'='*60}")
@@ -127,10 +103,7 @@ def run_single_backtest(model_name: str,
         max_leverage=CONFIG['max_leverage'],
         max_position_pct=CONFIG['max_position_pct'],
         max_short_exposure=CONFIG['max_short_exposure'],
-        risk_premium=risk_premium,
         vrp_calculator=vrp_calculator,
-        vrp_method=CONFIG['vrp_method'],
-        use_all_dte=CONFIG['use_all_dte'],
         target_dte=CONFIG['target_dte']
     )
     engine.set_strategy(strategy)
@@ -141,13 +114,12 @@ def run_single_backtest(model_name: str,
     
     return results, engine, trade_log
 
-
-def run_all_backtests() -> Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.DataFrame]]:
+def run_all_backtests() -> Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.DataFrame, pd.DataFrame]]:
     """
     Run backtests for all volatility models.
     
     Returns:
-        Dictionary mapping model_name -> (results_df, engine, expiry_log)
+        Dictionary mapping model_name -> (results_df, engine, expiry_log, early_exit_log)
  
     Steps:
         1. Load price and VIX data
@@ -175,19 +147,17 @@ def run_all_backtests() -> Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.Data
     if 'log_ret' not in prices_df.columns:
         prices_df['log_ret'] = np.log(prices_df['close'] / prices_df['close'].shift(1)) * 100
     
-    # Initialize VRP calculator (if enabled)
+    # Initialize VRP calculator
     vrp_calc = None
     if CONFIG['use_vrp_calculator']:
         print("\nInitializing Variance Risk Premium calculator...")
         vrp_calc = VarianceRiskPremiumCalculator(
             prices_df=prices_df,
             vix_df=vix_df,
-            rv_window=CONFIG['vrp_rv_window'],
-            vrp_lookback=CONFIG['vrp_lookback'],
-            use_regime=CONFIG['vrp_use_regime']
+            rv_window=CONFIG['vrp_rv_window']
         )
         
-        # Fit on data before backtest start date (no look-ahead bias)
+        # Fit on data before backtest start date
         vrp_calc.fit(end_date=CONFIG['start_date'])
         
         # Print VRP summary
@@ -197,18 +167,18 @@ def run_all_backtests() -> Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.Data
     # Initialize results_dict
     results = {}
 
-    ## Run backtest for each modeling approach
-    
+
     # Historical RV model
     hist_model = RollingVolCalculator(window=CONFIG['historical_window'], annualize=True)
     results_df, engine, trade_log = run_single_backtest(
         'historical', 
         hist_model,
-        vrp_calculator=vrp_calc,
-        risk_premium=CONFIG['risk_premium_fallback'] if not CONFIG['use_vrp_calculator'] else 0.0
+        vrp_calculator=vrp_calc
     )
+    # Log expiries and early exits
     expiry_log = pd.DataFrame(engine.portfolio.expiry_log) if engine.portfolio.expiry_log else pd.DataFrame()
-    results['historical'] = (results_df, engine, expiry_log)
+    early_exit_log = pd.DataFrame(engine.portfolio.early_exit_log) if engine.portfolio.early_exit_log else pd.DataFrame()
+    results['historical'] = (results_df, engine, expiry_log, early_exit_log)
     
     trade_log_path = os.path.join(trade_logs_dir, 'historical_trade_log.csv')
     trade_log.to_csv(trade_log_path, index=False)
@@ -219,11 +189,12 @@ def run_all_backtests() -> Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.Data
     results_df, engine, trade_log = run_single_backtest(
         'GARCH',
         garch,
-        vrp_calculator=vrp_calc,
-        risk_premium=CONFIG['risk_premium_fallback'] if not CONFIG['use_vrp_calculator'] else 0.0
+        vrp_calculator=vrp_calc
     )
+    # Log expiries and early exits
     expiry_log = pd.DataFrame(engine.portfolio.expiry_log) if engine.portfolio.expiry_log else pd.DataFrame()
-    results['GARCH'] = (results_df, engine, expiry_log)
+    early_exit_log = pd.DataFrame(engine.portfolio.early_exit_log) if engine.portfolio.early_exit_log else pd.DataFrame()
+    results['GARCH'] = (results_df, engine, expiry_log, early_exit_log)
     
     trade_log_path = os.path.join(trade_logs_dir, 'GARCH_trade_log.csv')
     trade_log.to_csv(trade_log_path, index=False)
@@ -233,15 +204,16 @@ def run_all_backtests() -> Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.Data
     print("\nPre-training XGBoost model...")
     xgb_model = MLForecaster(pretrained=True)
     xgb_model.pretrain(prices_df, vix_df, cutoff_date=CONFIG['start_date'])
-    
+
     results_df, engine, trade_log = run_single_backtest(
         'XGB', 
         xgb_model,
-        vrp_calculator=vrp_calc,
-        risk_premium=CONFIG['risk_premium_fallback'] if not CONFIG['use_vrp_calculator'] else 0.0)
-
+        vrp_calculator=vrp_calc
+    )
+    # Log expiries and early exits
     expiry_log = pd.DataFrame(engine.portfolio.expiry_log) if engine.portfolio.expiry_log else pd.DataFrame()
-    results['XGB'] = (results_df, engine, expiry_log)
+    early_exit_log = pd.DataFrame(engine.portfolio.early_exit_log) if engine.portfolio.early_exit_log else pd.DataFrame()
+    results['XGB'] = (results_df, engine, expiry_log, early_exit_log)
     
     trade_log_path = os.path.join(trade_logs_dir, 'XGB_trade_log.csv')
     trade_log.to_csv(trade_log_path, index=False)
@@ -249,13 +221,10 @@ def run_all_backtests() -> Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.Data
 
     return results
 
-
-# ============================================================================
-# PERFORMANCE METRICS
-# ============================================================================
-
+# Performance metrics
 def calculate_performance_metrics(equity_curve: pd.Series, 
                                  expiry_log: pd.DataFrame = None,
+                                 early_exit_log: pd.DataFrame = None,
                                  initial_capital: float = 1000000,
                                  risk_free_rate: float = 0.027) -> Dict[str, float]:
     """
@@ -265,7 +234,7 @@ def calculate_performance_metrics(equity_curve: pd.Series,
         equity_curve: Series of portfolio equity over time
         expiry_log: DataFrame of option expirations with realized P&L
         initial_capital: Starting capital
-        risk_free_rate: Annual risk-free rate (default 2.7%)
+        risk_free_rate: Annual risk-free rate for Sharpe ratio (Use 2.7%)
         
     Returns:
         Dictionary with performance metrics
@@ -293,16 +262,28 @@ def calculate_performance_metrics(equity_curve: pd.Series,
     drawdown = (equity_curve - running_max) / running_max
     max_drawdown = drawdown.min()
     
-    # Win rate (based on individual option expirations, not days)
-    if expiry_log is not None and len(expiry_log) > 0:
-        # Each expiry event represents completed trades with realized P&L
-        winning_trades = (expiry_log['pnl'] > 0).sum()
-        total_trades = len(expiry_log)
-        win_rate = winning_trades / total_trades if total_trades > 0 else 0.0
-    else:
-        # Fallback to daily returns if no expiry log available
-        win_rate = (returns > 0).sum() / len(returns)
+    # Win rate (combined from expiries and early exits)
+    winning_trades_expiry = 0
+    total_trades_expiry = 0
+    winning_trades_early_exit = 0
+    total_trades_early_exit = 0
     
+    # Count expiry trades (exclude daily aggregates)
+    if expiry_log is not None and len(expiry_log) > 0 and 'position_key' in expiry_log.columns:
+        non_aggregate_expiry_log = expiry_log[expiry_log['position_key'] != 'Daily Expiry PnL']
+        winning_trades_expiry = (non_aggregate_expiry_log['pnl'] > 0).sum()
+        total_trades_expiry = len(non_aggregate_expiry_log)
+    
+    # Count early exit trades
+    if early_exit_log is not None and len(early_exit_log) > 0 and 'pnl' in early_exit_log.columns:
+        winning_trades_early_exit = (early_exit_log['pnl'] > 0).sum()
+        total_trades_early_exit = len(early_exit_log)
+    
+    # Combined win rate across all closed trades
+    total_winning = winning_trades_expiry + winning_trades_early_exit
+    total_trades = total_trades_expiry + total_trades_early_exit
+    win_rate = total_winning / total_trades if total_trades > 0 else 0.0
+
     # Volatility
     volatility = std_daily_return * np.sqrt(252)
     
@@ -319,13 +300,12 @@ def calculate_performance_metrics(equity_curve: pd.Series,
         'Calmar Ratio': calmar_ratio
     }
 
-
-def create_metrics_comparison_table(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.DataFrame]]) -> pd.DataFrame:
+def create_metrics_comparison_table(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.DataFrame, pd.DataFrame]]) -> pd.DataFrame:
     """
     Create comparison table of metrics across all models.
     
     Args:
-        all_results: Dict mapping model_name -> (results_df, engine, expiry_log)
+        all_results: Dict mapping model_name -> (results_df, engine, expiry_log, early_exit_log)
         
     Returns:
         DataFrame with models as rows, metrics as columns
@@ -333,9 +313,9 @@ def create_metrics_comparison_table(all_results: Dict[str, Tuple[pd.DataFrame, B
     """
     metrics_list = []
 
-    for model_name, (results_df, _, expiry_log) in all_results.items():
+    for model_name, (results_df, _, expiry_log, early_exit_log) in all_results.items():
         equity = results_df['equity']
-        metrics = calculate_performance_metrics(equity, expiry_log, CONFIG['initial_capital'])
+        metrics = calculate_performance_metrics(equity, expiry_log, early_exit_log, CONFIG['initial_capital'])
         metrics['Model'] = model_name
         metrics_list.append(metrics)
     
@@ -348,19 +328,15 @@ def create_metrics_comparison_table(all_results: Dict[str, Tuple[pd.DataFrame, B
     
     return df
 
-
-# ============================================================================
-# VISUALIZATION
-# ============================================================================
-
-def plot_equity_curves(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.DataFrame]], 
+# Visualization Functions
+def plot_equity_curves(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.DataFrame, pd.DataFrame]], 
                       save_path: str = None):
     """
     Plot equity curves for all models on one chart with SPY buy-and-hold benchmark.
     
     Args:
-        all_results: Dict mapping model_name -> (results_df, engine, expiry_log)
-        save_path: Path to save figure (optional)
+        all_results: Dict mapping model_name -> (results_df, engine, expiry_log, early_exit_log)
+        save_path: Path to save figure
 
     """
     plt.figure(figsize=(12, 6))
@@ -370,7 +346,7 @@ def plot_equity_curves(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngine
     initial_capital = first_engine.portfolio.initial_capital
     
     # Plot all strategy equity curves
-    for model_name, (results_df, _, _) in all_results.items():
+    for model_name, (results_df, _, _, _) in all_results.items():
         plt.plot(results_df['date'], results_df['equity'], 
                 label=model_name, linewidth=2)
     
@@ -411,18 +387,14 @@ def plot_equity_curves(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngine
     
     plt.show()
 
-def plot_iv_comparison(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.DataFrame]],
+def plot_iv_comparison(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.DataFrame, pd.DataFrame]],
                       save_path: str = None):
     """
     Plot implied volatility predictions from all models over time with VIX benchmark.
     
     Args:
-        all_results: Dict mapping model_name -> (results_df, engine, expiry_log)
+        all_results: Dict mapping model_name -> (results_df, engine, expiry_log, early_exit_log)
         save_path: Path to save figure (optional)
-    
-    Shows how different volatility forecasting models predict IV over time
-    compared to the VIX (market's volatility expectation).
-    Useful for understanding model divergence and identifying regime changes.
     """
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), 
                                      gridspec_kw={'height_ratios': [2, 1]})
@@ -454,7 +426,7 @@ def plot_iv_comparison(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngine
                 color='black', linestyle='--', alpha=0.7, zorder=10)
     
     # Plot model predictions
-    for model_name, (_, engine, _) in all_results.items():
+    for model_name, (_, engine, _, _) in all_results.items():
         if engine.portfolio.iv_log:
             iv_df = pd.DataFrame(engine.portfolio.iv_log)
             iv_df['date'] = pd.to_datetime(iv_df['date'])
@@ -471,7 +443,7 @@ def plot_iv_comparison(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngine
     
     # Plot 2: Difference from VIX (Model Error)
     if has_vix:
-        for model_name, (_, engine, _) in all_results.items():
+        for model_name, (_, engine, _, _) in all_results.items():
             if engine.portfolio.iv_log:
                 iv_df = pd.DataFrame(engine.portfolio.iv_log)
                 iv_df['date'] = pd.to_datetime(iv_df['date'])
@@ -505,18 +477,15 @@ def plot_iv_comparison(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngine
     
     plt.show()
 
-# ============================================================================
-# REPORTING
-# ============================================================================
-
-def save_results_to_csv(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.DataFrame]],
+# Storing Remaining Results
+def save_results_to_csv(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngine, pd.DataFrame, pd.DataFrame]],
                        metrics_df: pd.DataFrame,
                        output_dir: str):
     """
     Save all results to CSV files.
     
     Args:
-        all_results: Dict mapping model_name -> (results_df, engine, expiry_log)
+        all_results: Dict mapping model_name -> (results_df, engine, expiry_log, early_exit_log)
         metrics_df: DataFrame with performance metrics
         output_dir: Directory to save files
         
@@ -526,9 +495,7 @@ def save_results_to_csv(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngin
         - {model_name}_expiry_log.csv: Expiry events for each model
         - {model_name}_iv_log.csv: Daily IV predictions for each model
         - combined_iv.csv: All IV predictions in one file
-        
-    Note: Trade logs are saved separately in trade_logs/ subdirectory 
-          by run_all_backtests() function.
+
     """
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -539,7 +506,7 @@ def save_results_to_csv(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngin
     print(f"  Saved metrics to: {metrics_path}")
     
     # Save individual equity curves, expiry logs, and IV logs
-    for model_name, (results_df, engine, _) in all_results.items():
+    for model_name, (results_df, engine, _, _) in all_results.items():
         # Save equity curve
         equity_path = os.path.join(output_dir, f'equity_logs/{model_name}_equity.csv')
         results_df.to_csv(equity_path, index=False)
@@ -567,9 +534,9 @@ def save_results_to_csv(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngin
             iv_df.to_csv(iv_path, index=False)
             print(f"  Saved {model_name} IV log to: {iv_path}")
     
-    # Save combined IV predictions (all models' IVs side-by-side with VIX)
+    # Save combined IV predictions
     combined_iv_df = pd.DataFrame()
-    for model_name, (_, engine, _) in all_results.items():
+    for model_name, (_, engine, _, _) in all_results.items():
         if engine.portfolio.iv_log:
             iv_df = pd.DataFrame(engine.portfolio.iv_log)
             if combined_iv_df.empty:
@@ -605,19 +572,13 @@ def save_results_to_csv(all_results: Dict[str, Tuple[pd.DataFrame, BacktestEngin
         append_vrp_to_combined_iv(combined_iv_path)
         print(f"Successfully appended VRP values to {combined_iv_path}")
 
-# ============================================================================
-# VRP UTILITIES
-# ============================================================================
-
+# VRP Function
 def append_vrp_to_combined_iv(combined_iv_path: str = None):
     """
     Append VRP adjustment column to combined_iv.csv.
     
-    The VRP column shows what was added to RV forecasts to get IV estimates.
-    To get the raw RV forecast: *_iv - vrp_adjustment
-    
     Args:
-        combined_iv_path: Path to combined_iv.csv (defaults to results/combined_iv.csv)
+        combined_iv_path: Path to combined_iv.csv
     """
     if combined_iv_path is None:
         combined_iv_path = os.path.join(CONFIG['results_dir'], 'combined_iv.csv')
@@ -634,9 +595,7 @@ def append_vrp_to_combined_iv(combined_iv_path: str = None):
     vrp_calc = VarianceRiskPremiumCalculator(
         prices_df=prices_df,
         vix_df=vix_df,
-        rv_window=CONFIG['vrp_rv_window'],
-        vrp_lookback=CONFIG['vrp_lookback'],
-        use_regime=CONFIG['vrp_use_regime']
+        rv_window=CONFIG['vrp_rv_window']
     )
     
     # Fit on data before first date in the IV log
@@ -646,7 +605,7 @@ def append_vrp_to_combined_iv(combined_iv_path: str = None):
     vrp_values = []
     for date in df['date']:
         try:
-            vrp = vrp_calc.get_vrp_adjustment(pd.Timestamp(date), method=CONFIG['vrp_method'])
+            vrp = vrp_calc.get_vrp_adjustment(pd.Timestamp(date))
         except:
             vrp = np.nan
         vrp_values.append(vrp)
@@ -659,11 +618,7 @@ def append_vrp_to_combined_iv(combined_iv_path: str = None):
     print(f"  Mean VRP: {np.nanmean(vrp_values):.4f} ({np.nanmean(vrp_values)*100:.2f}%)")
     print(f"  To get raw RV forecast: [model]_iv - vrp_adjustment")
 
-
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
-
+# Main
 def main():
     """
     Main execution function.
@@ -702,53 +657,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# ============================================================================
-# INTERVIEW PREPARATION NOTES
-# ============================================================================
-
-"""
-KEY QUESTIONS TO PREPARE FOR:
-
-1. "Why did you choose these 4 volatility models?"
-   - Historical: Naive baseline (assumes vol is constant)
-   - Surface: Market benchmark (what is market pricing?)
-   - GARCH: Industry standard for vol forecasting (econometric)
-   - ML: Modern approach (non-parametric, captures complex patterns)
-
-2. "Which model performed best and why?"
-   - [Your analysis here after running backtests]
-   - Consider: Did GARCH beat ML? Why/why not?
-   - Did any model beat the surface (market)?
-
-3. "What were the main challenges?"
-   - Data quality, model overfitting, transaction costs
-   - Rebalancing frequency, position sizing
-   - Walk-forward validation (avoiding lookahead bias)
-
-4. "How would you improve this strategy?"
-   - Better execution (limit orders vs market orders)
-   - Dynamic position sizing based on conviction
-   - Ensemble of models (combine forecasts)
-   - Additional filters (liquidity, bid-ask spread)
-   - Risk management (stop losses, max drawdown limits)
-
-5. "What did you learn about volatility forecasting?"
-   - Vol is mean-reverting but has clusters
-   - Recent vol is highly predictive of near-term vol
-   - Implied vol > realized vol on average (variance risk premium)
-   - Model accuracy matters less than directional correctness
-
-6. "How realistic is this backtest?"
-   - Pros: Real data, transaction costs, delta hedging
-   - Cons: No slippage, perfect fills, no funding costs
-   - Improvement: Add bid-ask spreads, simulate fills
-
-7. "What role would this play in a portfolio?"
-   - Market-neutral (low correlation to equity markets)
-   - Volatility harvesting strategy
-   - Crisis alpha potential (vol spikes)
-   - Diversification benefit
-"""
-

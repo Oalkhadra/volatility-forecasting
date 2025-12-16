@@ -16,7 +16,6 @@ from scipy.stats import norm
 from pathlib import Path
 import time
 import sys
-import argparse
 
 # Add parent for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -36,16 +35,23 @@ MIN_VOL = 0.001
 MAX_VOL = 5.0
 
 
-# =============================================================================
-# VECTORIZED BLACK-SCHOLES
-# =============================================================================
+# Vectorized Black-Scholes Functions
 
 def bs_price_vec(S: np.ndarray, K: np.ndarray, T: np.ndarray, r: np.ndarray, 
                  sigma: np.ndarray, is_call: np.ndarray) -> np.ndarray:
     """
     Vectorized Black-Scholes price calculation.
     
-    All inputs are numpy arrays of the same shape.
+    Args:
+        S: Underlying price (array)
+        K: Strike price (array)
+        T: Time to expiry in years (array)
+        r: Risk-free rate (array)
+        sigma: Implied volatility (array)
+        is_call: Boolean array (True for calls)
+
+    Returns:
+        Array of Black-Scholes prices
     """
     # Avoid division by zero
     sqrt_T = np.sqrt(np.maximum(T, 1e-10))
@@ -66,7 +72,15 @@ def bs_vega_vec(S: np.ndarray, K: np.ndarray, T: np.ndarray, r: np.ndarray,
     """
     Vectorized vega calculation (same for calls and puts).
     
-    Returns vega scaled for Newton-Raphson (per 1.0 vol change, not per 1%).
+    Args:
+        S: Underlying price (array)
+        K: Strike price (array)
+        T: Time to expiry in years (array)
+        r: Risk-free rate (array)
+        sigma: Implied volatility (array)
+
+    Returns:
+        Array of Black-Scholes vega
     """
     sqrt_T = np.sqrt(np.maximum(T, 1e-10))
     sigma_safe = np.maximum(sigma, 1e-10)
@@ -77,33 +91,44 @@ def bs_vega_vec(S: np.ndarray, K: np.ndarray, T: np.ndarray, r: np.ndarray,
 
 
 def intrinsic_value_vec(S: np.ndarray, K: np.ndarray, is_call: np.ndarray) -> np.ndarray:
-    """Vectorized intrinsic value calculation."""
+    """
+    Vectorized intrinsic value calculation.
+
+    Args:
+        S: Underlying price (array)
+        K: Strike price (array)
+        is_call: Boolean array (True for calls)
+
+    Returns:
+        Array of intrinsic values
+    """
     call_intrinsic = np.maximum(S - K, 0)
     put_intrinsic = np.maximum(K - S, 0)
+
     return np.where(is_call, call_intrinsic, put_intrinsic)
 
 
-# =============================================================================
-# VECTORIZED IV SOLVER
-# =============================================================================
-
-def initial_vol_guess(S: np.ndarray, K: np.ndarray, T: np.ndarray, 
-                      price: np.ndarray, is_call: np.ndarray) -> np.ndarray:
+# Implied Vol Functions
+def initial_vol_guess(S: np.ndarray, T: np.ndarray, price: np.ndarray) -> np.ndarray:
     """
     Brenner-Subrahmanyam approximation for initial IV guess.
     
     Formula: σ ≈ √(2π/T) * (C/S) for ATM options
     Adjusted for moneyness.
+
+    Args:
+        S: Underlying price (array)
+        T: Time to expiry in years (array)
+        price: Market prices (array)
+
+    Returns:
+        Array of initial volatility guesses
     """
-    # Simple approximation that works reasonably well
-    # For ATM: sigma ≈ price / (0.4 * S * sqrt(T))
-    sqrt_T = np.sqrt(np.maximum(T, 1e-10))
-    
     # Brenner-Subrahmanyam for ATM
     atm_approx = np.sqrt(2 * np.pi / np.maximum(T, 0.01)) * (price / S)
     
     # Clamp to reasonable range
-    return np.clip(atm_approx, 0.05, 2.0)
+    return np.clip(atm_approx, 0.05, 1.0)
 
 
 def implied_volatility_vec(
@@ -118,9 +143,6 @@ def implied_volatility_vec(
 ) -> np.ndarray:
     """
     Vectorized implied volatility calculation using Newton-Raphson.
-    
-    Calculates IV for all options simultaneously using array operations.
-    This is 100-1000x faster than looping through options individually.
     
     Args:
         price: Market prices (array)
@@ -203,10 +225,7 @@ def implied_volatility_vec(
     return sigma
 
 
-# =============================================================================
-# MAIN PIPELINE
-# =============================================================================
-
+# Main Pipeline
 def enrich_with_iv(
     input_file: Path = INPUT_FILE,
     output_file: Path = OUTPUT_FILE
@@ -291,67 +310,6 @@ def enrich_with_iv(
     return df
 
 
-def load_options_with_iv(data_dir: Path = DATA_DIR) -> pd.DataFrame:
-    """
-    Convenience function to load the options data with IV.
-    
-    Args:
-        data_dir: Directory containing the processed data
-    
-    Returns:
-        DataFrame with options data including 'vol' column
-    """
-    file_path = data_dir / "spy_options.parquet"
-    df = pd.read_parquet(file_path)
-    
-    if 'vol' not in df.columns:
-        print("Warning: 'vol' column not found. Run enrich_with_iv() first.")
-    
-    return df
-
-
-# =============================================================================
-# SINGLE OPTION CALCULATION (for testing/debugging)
-# =============================================================================
-
-def calculate_iv_single(row: dict) -> float:
-    """
-    Calculate IV for a single option (wrapper for compatibility).
-    
-    Args:
-        row: Dictionary with option data
-    
-    Returns:
-        Implied volatility as float, or np.nan if calculation fails
-    """
-    price = np.array([row['mid_price']])
-    S = np.array([row['underlying_price']])
-    K = np.array([row['strike']])
-    T = np.array([row['days_to_expiry'] / 365.0])
-    r = np.array([row['risk_free_rate']])
-    is_call = np.array([row['call_put'] == 'call'])
-    
-    result = implied_volatility_vec(price, S, K, T, r, is_call)
-    return result[0]
-
-
-# =============================================================================
-# ENTRY POINT
-# =============================================================================
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Calculate IV for options data (vectorized)")
-    parser.add_argument("--input", type=str, default=str(INPUT_FILE),
-                       help="Input parquet file path")
-    parser.add_argument("--output", type=str, default=str(OUTPUT_FILE),
-                       help="Output parquet file path")
-    
-    args = parser.parse_args()
-    
-    # Run pipeline
-    df = enrich_with_iv(
-        input_file=Path(args.input),
-        output_file=Path(args.output)
-    )
-    
+    df = enrich_with_iv(input_file=INPUT_FILE, output_file=OUTPUT_FILE)
     print("\n✓ Done!")

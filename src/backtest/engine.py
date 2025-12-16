@@ -11,21 +11,20 @@ import glob
 
 # Add parent directory to path for absolute imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from pricing.greeks import calculate_all_greeks, implied_volatility
 
 def create_option_key(symbol: str, strike: float, expiry: datetime, option_type: str) -> str:
-    """Create unique identifier for an option."""
+    """Create unique identifier for an option for logging."""
     return f"{symbol}_{strike:.0f}{option_type[0].upper()}_{expiry.strftime('%Y%m%d')}"
 
 @dataclass
 class Position:
     """Represents a single option or stock position."""
     symbol: str
-    quantity: float          # Positive = Long, Negative = Short
+    quantity: float        
     entry_price: float
     current_price: float
-    position_type: str       # 'option' or 'stock'
+    position_type: str   # 'option' or 'stock'
     
     # Option specifics (None for stock)
     strike: Optional[float] = None
@@ -51,7 +50,7 @@ class Position:
         
         if self.option_type == 'call':
             return max(0, underlying_price - self.strike)
-        else:  # put
+        else:
             return max(0, self.strike - underlying_price)
 
 @dataclass
@@ -63,12 +62,13 @@ class Trade:
     trade_type: str
     timestamp: datetime
     
+    # Option specifics (None for stock)
     strike: Optional[float] = None
     expiry: Optional[datetime] = None
     option_type: Optional[str] = None
-    implied_vol: Optional[float] = None  # Store IV for daily rebalancing
-    delta: Optional[float] = None  # Store calculated delta for trade log validations
-    mispricing_pct: Optional[float] = None  # Actual mispricing % at entry
+    implied_vol: Optional[float] = None     # Store IV for daily rebalancing
+    delta: Optional[float] = None           # Store calculated delta for trade log validations
+    mispricing_pct: Optional[float] = None  # Mispricing % at entry
     
     def get_key(self) -> str:
         """Get unique position key for this trade."""
@@ -85,9 +85,9 @@ class Portfolio:
         self.positions: Dict[str, Position] = {}
         self.history: List[dict] = []
         self.trade_log: List[Trade] = []
-        self.expiry_log: List[dict] = []  # Separate log for expiry events
+        self.expiry_log: List[dict] = []      # Log for expiry events
         self.early_exit_log: List[dict] = []  # Log for early exit events
-        self.iv_log: List[dict] = []  # Daily IV predictions from the strategy
+        self.iv_log: List[dict] = []          # Log for daily IV predictions from the strategy
         
     def execute_trade(self, trade: Trade, apply_costs: bool = True):
         """
@@ -109,7 +109,7 @@ class Portfolio:
                 transaction_cost = abs(trade.quantity) * 0.5
             else:  # stock
                 # 5 bips (0.05%)
-                transaction_cost = abs(trade.quantity * trade.price) * 0.0005
+                transaction_cost = abs(trade.quantity * trade.price) * 0.0005 # Accounting for slippage, bid/ask spread, etc. (SPY is highly liquid)
         
         # Update cash (buying = negative, selling = positive)
         self.cash -= (base_cost + transaction_cost)
@@ -124,7 +124,7 @@ class Portfolio:
         if pos_key in self.positions:
             pos = self.positions[pos_key]
             
-            # Weighted average cost basis (only if adding to position)
+            # Weighted average cost basis
             is_same_direction = (pos.quantity > 0 and trade.quantity > 0) or \
                                 (pos.quantity < 0 and trade.quantity < 0)
             
@@ -156,7 +156,6 @@ class Portfolio:
             )
             self.positions[pos_key] = new_pos
         
-
     def mark_to_market(self, current_prices: Dict[str, float], date: datetime):
         """
         Update all positions with current market prices.
@@ -215,7 +214,7 @@ class Portfolio:
                 # Mark for removal
                 expired_keys.append(pos_key)
 
-                # Log option expiry event
+                # Log option-level expiry event
                 self.expiry_log.append({
                     'date': current_date,
                     'event': 'expiry',
@@ -225,11 +224,12 @@ class Portfolio:
                     'quantity': pos.quantity,
                     'pnl': pnl
                 })
+
         # Remove expired positions
         for key in expired_keys:
             del self.positions[key]
         
-        # Log expiry event separately if there was activity
+        # Log full daily expiry event
         if total_pnl != 0:
             self.expiry_log.append({
                 'date': current_date,
@@ -268,13 +268,9 @@ class Portfolio:
             quantity: Quantity closed (negative of original position)
             entry_price: Original entry price (for P&L calculation)
         """
-        # Calculate P&L if entry price provided
-        # For options: (exit_price - entry_price) * quantity * 100
-        # quantity is negative for closing longs, positive for closing shorts
+        # Calculate P&L
         pnl = None
-        if entry_price is not None:
-            # Closing a long (quantity < 0): profit if exit > entry
-            # Closing a short (quantity > 0): profit if exit < entry
+        if entry_price is not None: # Error handling (Should always pass)
             pnl = (exit_price - entry_price) * quantity * 100
         
         self.early_exit_log.append({
@@ -305,25 +301,23 @@ class Portfolio:
                 # Calculate time to expiry in years (use total days, not just day component)
                 T = max(0, (pos.expiry - current_date).days / 365.0)
                 
-
-                # Use stored IV instead of recalculating
+                # Use stored IV
                 if pos.implied_vol:
                     sigma = pos.implied_vol  
                     
                 else:
                     try:
                         # Calculate implied volatility at current moment
-                        sigma = implied_volatility(
-                                                option_price = pos.current_price,
-                                                S = S,
-                                                K=pos.strike,
-                                                T=T,
-                                                r=r,
-                                                option_type=pos.option_type)
+                        sigma = implied_volatility(option_price = pos.current_price,
+                                                    S = S,
+                                                    K=pos.strike,
+                                                    T=T,
+                                                    r=r,
+                                                    option_type=pos.option_type)
                     except Exception as e:
                         print(f"IV Calculation caused an error: {e}")
-                        print("Defaulting to 0.2 Vol")
-                        sigma = 0.11
+                        print("Defaulting to 0.13 IV")
+                        sigma = 0.13
 
                 # Get option delta
                 greeks = calculate_all_greeks(
@@ -365,7 +359,6 @@ class BacktestEngine:
     def load_data(self, options_dir: str, prices_path: str, rates_path: str):
         """
         Load market data and filter to backtest date range.
-        Note: Keeps historical price data before start_date for rolling calculations.
         
         Args:
             options_dir: Directory containing spy_options_YYYY_MM.parquet files
@@ -435,7 +428,7 @@ class BacktestEngine:
                 if len(option_match) > 0:
                     # Use actual market mid_price
                     prices[pos_key] = option_match.iloc[0]['mid_price']
-                # If not found, position keeps its last known price (mark_to_market handles this)
+                # If not found, position keeps its last known price
         
         return prices
     
@@ -455,7 +448,7 @@ class BacktestEngine:
         # If total_delta > 0, sell shares (negative qty). If < 0, buy shares (positive qty).
         rebalance_qty = -total_delta
 
-        if abs(rebalance_qty) > 0.01:  # Add small threshold to avoid tiny trades
+        if abs(rebalance_qty) > 0.01:  # Small threshold to avoid tiny trades
             trade = Trade(ticker, rebalance_qty, underlying_price, 'stock', current_date)
             self.portfolio.execute_trade(trade, True)
 
@@ -495,14 +488,12 @@ class BacktestEngine:
     def _get_atm_iv_forecast(self, underlying_price: float, current_date: datetime, r: float) -> float:
         """
         Get IV forecast for ATM option from the strategy's vol model.
-        Uses the strategy's existing calculate_theo_price which handles all model types.
         """
         # ATM strike (rounded to nearest strike)
         K = round(underlying_price / 5) * 5
         T = 30 / 365  # 30-day forecast horizon
         
         # Use strategy's method to get theo price and IV
-        # This handles ALL model types (Historical, Surface, GARCH, ML)
         _, sigma = self.strategy.calculate_theo_price(
             S=underlying_price,
             K=K,
@@ -581,9 +572,6 @@ class BacktestEngine:
                         entry_price=entry_price
                     )
             
-            # Rebalance delta after expiries and early exits
-            self.rebalance_delta(current_date, underlying_price, current_rate, 'SPY')
-            
             # Generate signals for this trading day
             signals = self.strategy.generate_signals(
                 self.portfolio, options_snapshot, underlying_price, current_date
@@ -594,8 +582,7 @@ class BacktestEngine:
                 # Use the IV from the first signal as representative
                 predicted_iv = signals[0].implied_vol
             else:
-                # No signals generated, but still want to log IV forecast
-                # Get ATM implied vol forecast from strategy
+                # No signals generated, calculate and log IV forecast
                 predicted_iv = self._get_atm_iv_forecast(underlying_price, current_date, current_rate)
             
             self.portfolio.log_iv_prediction(
@@ -612,7 +599,7 @@ class BacktestEngine:
                 hedge_trade = self.strategy.create_trade_from_signal(signal, 'stock')
                 self.portfolio.execute_trade(hedge_trade)
             
-            # Final delta rebalance after all trades to ensure neutrality
+            # Delta rebalance after all trades to ensure neutrality
             self.rebalance_delta(current_date, underlying_price, current_rate, 'SPY')
             
             # Mark to market with actual option prices from market data
