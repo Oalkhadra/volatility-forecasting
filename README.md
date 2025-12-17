@@ -23,9 +23,15 @@
 
 ## Executive Summary
 
-This project implements a complete backtesting framework to evaluate how different volatility forecasting methods translate into trading P&L. The core hypothesis is that more sophisticated volatility models (GARCH, Machine Learning) should identify option mispricings more accurately than naive historical volatility, leading to better risk-adjusted returns.
+This project implements a complete backtesting framework to evaluate different volatility forecasting methods through a delta-neutral SPY options trading strategy. The core hypothesis is that more sophisticated volatility models (GARCH, Machine Learning) should identify option mispricings more accurately than naive historical volatility, leading to better risk-adjusted returns.
 
-**Key Result**: While XGBoost significantly outperformed GARCH in volatility forecasting accuracy (p = 0.0043), **none of the strategies produced meaningful risk-adjusted returns** (all Sharpe ratios negative or near zero). The most interesting finding: **XGBoost generated substantial option-only P&L that was largely eroded by delta hedging costs**, highlighting the critical gap between forecasting accuracy and trading profitability.
+**Why Delta-Neutral?** The strategy employs delta hedging to isolate volatility exposure from directional market movements. This design choice ensures that performance differences between models stem from volatility forecasting accuracy rather than directional market exposure. However, while this approach eliminates directional bias, the hedge P&L significantly impacts overall returns, particularly in strongly trending markets.
+
+**Key Findings**: 
+- While XGBoost significantly outperformed GARCH in volatility forecasting accuracy, there was **no statistically significant difference** when comparing either model to a naive historical estimate
+- The delta-neutral trading strategy **did not produce a meaningful risk-adjusted return** regardless of the volatility forecasting method used
+- When examining options-only P&L (excluding hedge positions), **XGBoost generated over $1M in option profits**—demonstrating superior mispricing detection that was subsequently eroded by hedging costs in a trending market
+- Delta hedging can completely erode gains from a successful options strategy, while also providing a safety net for poorly performing ones
 
 ### Performance Summary (Jan 2020 - Nov 2025)
 
@@ -39,27 +45,11 @@ This project implements a complete backtesting framework to evaluate how differe
 
 ## Research Questions
 
-### Primary Question
-**Which volatility estimation method produces the best risk-adjusted returns when trading options with delta-neutral hedging?**
+#### 1. Which volatility estimation method produces the best risk-adjusted returns when trading options with delta-neutral hedging?
 
-*Approach*: Run identical trading strategies with different volatility inputs (Historical, GARCH, XGBoost) and compare Sharpe ratios, total returns, and drawdowns across a 5-year backtest period.
+#### 2. Is statistical forecasting accuracy predictive of trading performance?
 
-### Secondary Questions
-
-#### 1. Is statistical forecasting accuracy predictive of trading performance?
-*Approach*: Compare out-of-sample forecasting metrics (RMSE, correlation, QLIKE) against realized P&L. The hypothesis is that better forecasting should lead to better trading—but this project reveals that's not necessarily true.
-
-**Recommendation**: Analyze the disconnect between XGBoost's superior forecasting (RMSE 21% better than GARCH) and its marginal trading improvement. Consider metrics beyond point accuracy (e.g., directional accuracy during regime changes, tail event prediction).
-
-#### 2. Do sophisticated volatility models justify their complexity over simpler alternatives?
-*Approach*: Use Diebold-Mariano tests to determine if performance differences are statistically significant, then weigh against implementation complexity and computational costs.
-
-**Recommendation**: Frame this as an efficiency frontier analysis. GARCH requires daily refitting (computationally expensive) yet performs worst. Historical vol requires no training. XGBoost requires pre-training but is robust.
-
-#### 3. Why does option P&L not translate to strategy P&L?
-*Approach*: Decompose total P&L into: (1) Option trading P&L, (2) Delta hedge P&L, (3) Transaction costs. This reveals where value is created vs. destroyed.
-
-**Recommendation**: This is your most novel finding. Deep dive into hedge drag—the cost of continuously rebalancing delta-neutral positions in a trending market.
+#### 3. Are sophisticated volatility forecasting models significantly better than simple and naive alternatives?
 
 ---
 
@@ -67,9 +57,9 @@ This project implements a complete backtesting framework to evaluate how differe
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                           PROJECT TIMELINE                                   │
+│                           DATA SPLIT TIMELINE                               │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│  1993 ──────────── 2015 ──────────── 2020 ──────────── 2025                │
+│  1993 ──────────── 2015 ──────────── 2020 ──────────── 2025                 │
 │    │                 │                 │                 │                  │
 │    └─── TRAINING ────┘                 │                 │                  │
 │         (Vol Models)                   │                 │                  │
@@ -85,40 +75,57 @@ This project implements a complete backtesting framework to evaluate how differe
 ### Phase 1: Volatility Model Development (1993-2014 Training)
 
 1. **Data Preprocessing**: Load SPY prices (OHLCV), VIX data, and calculate log returns
+   - VIX regimes are defined using historical thresholds to compute regime-conditional VRP for use in the backtest
 2. **Feature Engineering** for XGBoost:
    - Lagged VIX (yesterday's close)
    - Realized volatility at multiple horizons (1d, 5d, 22d, 30d, 60d, 120d)
    - Leverage effect features (cumulative returns)
-   - Asymmetric volatility (negative semivariance from Patton & Sheppard 2015)
+   - Asymmetric volatility (negative semivariance)
 3. **Model Training**:
    - XGBoost: RandomizedSearchCV with TimeSeriesSplit (5-fold), optimized on Spearman correlation
    - GARCH: Rolling 30-day window, fit daily during backtest
    - Historical: Simple 30-day rolling standard deviation
+- Note: GARCH and Naive historical estimate do not require a training period.
 
 ### Phase 2: Model Testing (2015-2019)
 
 - Out-of-sample forecasting accuracy evaluation
-- Diebold-Mariano statistical significance tests
+- Diebold-Mariano statistical significance tests, QLIKE loss comparison
 - Regime-conditional performance analysis
+- Note: Model testing is only concerned with realized volatility forecasting accuracy
 
 ### Phase 3: Strategy Backtesting (2020-2025)
 
+The backtest applies each volatility model to a delta-neutral options trading strategy with the following characteristics:
+
+**Strategy Overview**:
+- **Objective**: Identify and trade mispriced options based on volatility forecasts
+- **Option Universe**: SPY options with 30 days to expiration (DTE), strikes within ±5% of spot
+- **Pricing Model**: Black-Scholes with model-forecasted implied volatility
+- **Position Sizing**: Maximum 21 positions (1 position for the underlying hedge), 2 contracts per trade, 1x leverage limit
+- **Risk Controls**: 40% max short exposure, 50% max single position size
+
+**Key Assumptions**:
+- Options are priced at mid-price (average of bid/ask)
+- Transaction costs: $0.50 per option contract, 5 bps for stock trades
+- Daily mark-to-market and hedge rebalancing
+
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         DAILY BACKTEST LOOP                                  │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  For each trading day:                                                       │
-│    1. Forecast realized volatility (RV) using vol model                     │
-│    2. Add Variance Risk Premium (VRP) adjustment → IV estimate              │
-│    3. Price all 30-DTE options using Black-Scholes with forecasted IV       │
-│    4. Identify mispricings:                                                 │
-│       • BUY if market price < 50% of theoretical (underpriced)              │
-│       • SELL if market price > 80% above theoretical (overpriced)           │
-│    5. Execute option trades with delta hedge (stock position)               │
-│    6. Rebalance delta hedges daily                                          │
-│    7. Handle expirations and early exits (if mispricing resolves)           │
-│    8. Mark-to-market and log P&L                                            │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                         DAILY BACKTEST LOOP                            │
+├────────────────────────────────────────────────────────────────────────┤
+│  For each trading day:                                                 │
+│    1. Forecast realized volatility (RV) using vol model                │
+│    2. Add Variance Risk Premium (VRP) based on regime → IV forecast    │
+│    3. Price all options using Black-Scholes with forecasted IV         │
+│    4. Identify mispricings:                                            │
+│       • BUY if market price < 50% of theoretical (underpriced)         │
+│       • SELL if market price > 80% above theoretical (overpriced)      │
+│    5. Execute option trades with delta hedge (stock position)          │
+│    6. Rebalance delta hedges daily                                     │
+│    7. Handle expirations and early exits (if mispricing resolves)      │
+│    8. Mark-to-market and log P&L                                       │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -137,10 +144,10 @@ This project implements a complete backtesting framework to evaluate how differe
 ```
 data/
 ├── processed/
-│   ├── spy_prices.parquet          # Daily SPY OHLCV (1993-2025)
+│   ├── spy_prices.parquet          # Daily SPY OHLCV
 │   ├── vix_data.parquet            # Daily VIX closes
 │   ├── risk_free_rate.parquet      # 13-week T-bill rates
-│   └── spy_options_YYYY_MM.parquet # Monthly option snapshots (60+ files)
+│   └── spy_options_YYYY_MM.parquet # Monthly option snapshots (2020-2025)
 └── raw/
     └── ...                          # Raw data before preprocessing
 ```
@@ -151,9 +158,9 @@ data/
 
 ### 1. Historical Rolling Volatility (Naive Baseline)
 
-**Implementation**: `src/volatility/historical.py`
+**Implementation**: `src/volatility/historical.py` → `RollingVolCalculator`
 
-The simplest approach—30-day trailing standard deviation of log returns, annualized.
+The simplest approach—30-day trailing standard deviation of log returns (lagged), annualized.
 
 ```
 σ_t = std(r_{t-29}, r_{t-28}, ..., r_t) × √252
@@ -197,7 +204,7 @@ Gradient boosting model trained on engineered features capturing volatility dyna
 | **VIX** | Yesterday's VIX close |
 | **Realized Vol** | 1d, 5d, 22d, 30d, 60d, 120d rolling volatility |
 | **Leverage Effect** | 1d, 22d, 30d, 60d, 120d cumulative returns |
-| **Asymmetric Vol** | 5-day negative semivariance (Patton & Sheppard 2015) |
+| **Asymmetric Vol** | 5-day negative semivariance |
 | **Horizon** | Forecast horizon (30 days) |
 
 **Training Configuration**:
@@ -207,7 +214,7 @@ Gradient boosting model trained on engineered features capturing volatility dyna
 - Best params: `n_estimators=300, max_depth=3, learning_rate=0.01`
 
 **Strengths**: Captures non-linear relationships, leverage effect, regime interactions  
-**Weaknesses**: Black-box, requires pre-training, potential overfitting
+**Weaknesses**: Difficult to interpret, potential to overfitting
 
 ---
 
@@ -217,7 +224,7 @@ Gradient boosting model trained on engineered features capturing volatility dyna
 
 **Implementation**: `src/volatility/vrp.py`
 
-Before pricing options, realized volatility forecasts are converted to implied volatility estimates by adding the Variance Risk Premium—the systematic compensation option sellers receive.
+Before pricing options, realized volatility forecasts are converted to implied volatility estimates by adding the Variance Risk Premium.
 
 ```
 IV_estimate = RV_forecast + VRP_adjustment
@@ -225,13 +232,12 @@ IV_estimate = RV_forecast + VRP_adjustment
 
 **VRP Estimation**:
 - Historical VRP = VIX(t) - RV(t → t+30)
-- Rolling 252-day average for stable estimates
 - Regime-conditional: Different VRP by VIX level
 
-- For backtest, regime-based VRP was used, with the following values:
+VRP is estimated on historical data (1993-2014) and applied based on the current VIX regime:
 
 | Regime | VIX Level | Mean VRP |
-|--------|-----------|-------------|
+|--------|-----------|----------|
 | Low | < 15 | 2.37% |
 | Normal | 15-25 | 3.32% |
 | High | ≥ 25 | 6.08% |
@@ -245,8 +251,8 @@ Mispricing % = (Market Price - Theoretical Price) / Theoretical Price
 ```
 
 **Trade Signals**:
-- **BUY** if market price < -50% of theoretical price (market significantly underpriced)
-- **SELL** if market price > +80% of theoretical (market significantly overpriced)
+- **BUY** if market price < -50% of theoretical price 
+- **SELL** if market price > +80% of theoretical
 
 *Asymmetric thresholds*: Selling has unlimited risk, so requires larger mispricing to compensate.
 
@@ -274,29 +280,37 @@ Hedge shares = -Option contracts × Delta × 100
 
 ## Results
 
-### Equity Curves
-
-All strategies underperformed SPY buy-and-hold, with GARCH experiencing a catastrophic 38% drawdown during the 2022 volatility regime.
-
-![Equity Curves](results/plots/equity_curves.png)
-
 ### Complete P&L
 
-XGBoost-based strategy saw huge options P&L upside, heavily suppressed by hedging costs
+XGBoost-based strategy saw substantial options P&L upside, heavily suppressed by hedging costs (results of which can be seen in the equity curves).
 
-![Equity Curves](results/backtest_analysis/pnl_analysis.png)
+![PnL Analysis](results/backtest_analysis/pnl_analysis.png)
+
+### Equity Curves
+
+![Equity Curves](results/plots/equity_curves.png)
 
 ### P&L Decomposition
 
 Based on $500,000 initial capital:
 
-| Strategy | Total Return | **Net P&L** |
-|----------|-------------|-------------|
-| **XGB** | +14.59% | **~+$73,000** |
-| Historical | -3.33% | **~-$17,000** |
-| GARCH | -32.63% | **~-$163,000** |
+| Strategy | Total Return | Net P&L |
+|----------|-------------|---------|
+| **XGB** | +14.59% | **+$72,949** |
+| Historical | -3.33% | **-$16,658** |
+| GARCH | -32.63% | **-$163,157** |
 
-**Critical Insight from Analysis**: The results exploration notebook reveals that XGBoost generated substantial *option-only* P&L, but delta hedging in a trending market destroyed significant gains. This is the "hedge drag" problem—continuously shorting stock (to hedge short puts) as the market rallies loses money on the hedge leg. Run the `results_exploration.ipynb` notebook to see the full P&L waterfall breakdown by strategy.
+**Critical Observation**: The `results_exploration.ipynb` notebook reveals that XGBoost generated substantial *option-only* P&L, but delta hedging in a trending market destroyed significant gains.
+
+#### Complete P&L Reconciliation
+
+| Strategy | Expiry P&L | Early Exit P&L | Total Option P&L | Hedge + Costs | Actual Equity Δ |
+|----------|------------|----------------|------------------|---------------|-----------------|
+| **XGB** | +$840,754 | +$258,972 | **+$1,099,726** | -$1,026,776 | +$72,949 |
+| Historical | +$14,144 | -$184,285 | -$170,141 | +$153,483 | -$16,658 |
+| GARCH | -$376,362 | -$347,348 | -$723,709 | +$560,553 | -$163,157 |
+
+**Interpretation**: XGBoost's option-only P&L of +$1.1M was almost entirely offset by hedge losses (-$1.03M). Conversely, GARCH's poor option performance (-$724K) was partially cushioned by hedge gains (+$561K). This demonstrates how delta hedging acts as a stabilizer—dampening both gains and losses.
 
 ### Trade Distribution
 
@@ -306,52 +320,55 @@ Based on $500,000 initial capital:
 | GARCH | 1,919 | 10% | 90% | 75% | 25% |
 | Historical | 1,634 | 24% | 76% | 65% | 35% |
 
-**XGB was more balanced but biased toward selling options (60% sells)**—primarily puts, which works well in rising markets but carries tail risk. GARCH and Historical were predominantly buying calls, essentially paying for upside exposure that often expired worthless.
-
-### Win Rates by Trade Type
-
-Win rates vary significantly by strategy and trade type. Run the `results_exploration.ipynb` notebook to see the detailed 4-way breakdown (Buy/Sell × Call/Put) with current results.
-
-**Key patterns observed**:
-- XGB's selling bias (60% sells) captures variance risk premium more effectively
-- GARCH and Historical's heavy call buying (75-90%) suffered in periods of declining implied volatility
-- Sell strategies generally outperformed buy strategies across all models
+**Key Patterns**:
+- XGB was more balanced but biased toward selling options (60% sells)—primarily puts, which works well in rising markets but carries tail risk
+- GARCH and Historical were predominantly buying calls, essentially paying for upside exposure that often expired worthless
+- XGB's selling bias captures variance risk premium more effectively
+- Put-centric trades generally outperformed call-centric trades across all models
 
 ---
 
 ## Key Findings & Insights
 
-### 1. Forecasting Accuracy ≠ Trading Profitability
+### 1. Which volatility estimation method produces the best risk-adjusted returns when trading options with delta-neutral hedging?
 
-XGBoost demonstrated statistically significant superiority over GARCH (p=0.0043 on QLIKE loss) and marginally outperformed Historical (5% RMSE reduction). Yet trading performance was marginal. **The bottleneck was not volatility forecasting—it was execution.**
-
-*Implication*: For a trading strategy, directional accuracy during regime transitions matters more than average point accuracy. Consider optimizing for trading-relevant metrics (e.g., accuracy on days with high option volume, accuracy during VIX spikes).
-
-### 2. The Hedge Drag Problem
+**XGBoost's volatility forecast was the most successful** in finding truly mispriced options. However, delta hedging in a strongly trending market (SPY +70% from 2020-2024) eroded nearly all option profits. The model was most successful during 2020-2023 (excluding the COVID crash), after which alpha appeared to decay.
 
 Delta hedging is theoretically necessary for isolating volatility exposure, but in practice:
-- **In trending markets** (2020-2024 SPY +70%): Continuous hedging means constantly shorting a rising asset
+- **In trending markets**: Continuous hedging means constantly shorting a rising asset
 - **Rebalancing costs compound**: Daily adjustments add friction
-- **Gamma scalping** requires realized volatility to exceed implied—but VRP means IV typically exceeds RV
+- **Gamma scalping requires RV > IV**: But VRP means IV typically exceeds RV
 
-*Implication*: Consider alternative hedge schedules (weekly rebalancing, delta bands, or dynamic hedge ratios based on market regime). Pure delta-neutrality may be too expensive.
+GARCH and naive historical were unable to consistently find truly mispriced options. In these cases, delta hedging actually cushioned losses from both underperforming strategies.
 
-### 3. Selling Options Dominates in Bull Markets
+### 2. Is statistical forecasting accuracy predictive of trading performance?
 
-XGB's selling bias (60% of trades) was more profitable than the buying-heavy approaches of GARCH (75% buys) and Historical (65% buys). This is effectively harvesting the variance risk premium—compensation for bearing tail risk.
+XGBoost demonstrated statistically significant superiority over GARCH (p=0.0043 on QLIKE loss) and marginally outperformed Historical (5% RMSE reduction). Yet overall trading performance was modest due to hedging costs.
 
-*Implication*: The strategy's success depends heavily on market regime. In a prolonged bear market or volatility spike (2008, March 2020), short volatility approaches would face massive losses. Consider regime-based position sizing or tail hedges.
+**The key insight**: Forecasting accuracy *does* translate to better option selection, as evidenced by XGBoost's +$1.1M option-only P&L. However, the path from accurate forecasts to profitable trading is mediated by strategy design, particularly hedging methodology.
 
-### 4. GARCH Fails Spectacularly
+#### Regime-Conditional Performance
 
-GARCH's 38% drawdown and 14% win rate reveal a systematic failure mode: its mean-reverting forecasts consistently undershoot during sustained high-volatility periods. This led to:
-- Heavy call buying (90% of trades were calls) at inflated prices
-- Missing selling opportunities (theoretical prices too low)
-- Catastrophic losses during 2022's volatility crush
+| Regime | XGB Sharpe | GARCH Sharpe | Historical Sharpe |
+|--------|------------|--------------|-------------------|
+| Low (VIX < 15) | -3.38 | -7.20 | -3.68 |
+| Normal (15-25) | **3.77** | -1.76 | -0.54 |
+| High (VIX > 25) | -1.02 | 1.91 | 1.03 |
 
-*Implication*: Pure GARCH is likely inappropriate for options trading. Consider augmenting with regime detection or using as one input to an ensemble.
+| Regime | XGB Win Rate | GARCH Win Rate | Historical Win Rate |
+|--------|--------------|----------------|---------------------|
+| Low (VIX < 15) | 33.6% | 22.4% | 41.2% |
+| Normal (15-25) | **61.2%** | 38.1% | 44.0% |
+| High (VIX > 25) | 43.7% | 49.7% | 47.0% |
 
-### 5. Statistical Significance vs. Economic Significance
+**Observations**:
+- XGBoost excelled in normal volatility regimes (Sharpe of 3.77, 61% win rate)
+- All models struggled in low-VIX environments
+- High-VIX regimes favored simpler models, possibly due to XGBoost overfitting to calmer historical patterns
+
+### 3. Are sophisticated volatility forecasting models significantly better than simple and naive alternatives?
+
+**Statistically**: XGBoost significantly outperforms GARCH (p=0.004), but neither model significantly beats naive historical volatility in forecasting accuracy.
 
 | Test | Result |
 |------|--------|
@@ -359,7 +376,12 @@ GARCH's 38% drawdown and 14% win rate reveal a systematic failure mode: its mean
 | XGB vs Historical | Not significant (p=0.26) |
 | GARCH vs Historical | Not significant (p=0.54) |
 
-Despite XGB's highly significant superiority over GARCH in forecasting, the trading edge was minimal. This underscores that **statistical significance is not sufficient for trading profitability**—transaction costs, execution quality, and strategy design matter equally.
+**Economically**: Despite lacking statistical significance in forecasting, XGBoost demonstrated clear economic value:
+- **6x higher win rate** than GARCH (61% vs 14%)
+- **$1.8M better option P&L** than GARCH (+$1.1M vs -$724K)
+- Only positive total return among all strategies
+
+This underscores that **statistical significance is not sufficient for trading profitability**—strategy design, transaction costs, and execution quality matter equally. Conversely, a model without statistically significant forecasting improvement can still add substantial economic value through better option selection and timing.
 
 ---
 
@@ -390,7 +412,7 @@ XGBoost vs GARCH:    DM = -2.85,  p = 0.004  (XGBoost significantly better) ✓
 
 **Interpretation**: XGBoost's outperformance over GARCH is robust (>99% confidence), but neither sophisticated model significantly beats naive historical volatility at forecasting.
 
-### Regime-Conditional Performance
+### Regime-Conditional Forecasting Performance
 
 | Regime | XGB RMSE | GARCH RMSE | Historical RMSE |
 |--------|----------|------------|-----------------|
@@ -455,30 +477,23 @@ options-trading/
 
 ## Future Research Directions
 
-### 1. Alternative Hedge Strategies
+### 1. Alternative Hedging Strategies
+The most impactful improvement would be revisiting the hedging methodology:
 - **Discrete rebalancing**: Weekly vs. daily hedging to reduce transaction costs
-- **Delta bands**: Only rebalance when delta exposure exceeds threshold
-- **Vega hedging**: Add VIX futures to hedge volatility exposure directly
+- **Delta bands**: Only rebalance when delta exposure exceeds a threshold (e.g., ±0.05)
+- **Gamma scalping optimization**: Hedge less frequently in low-gamma regimes
 
-### 2. Regime-Aware Position Sizing
-- Reduce short vol exposure when VIX term structure inverts (backwardation)
-- Increase position sizes during low-VRP regimes
-- Add tail hedges (OTM puts) during high-risk periods
+### 2. Ensemble Volatility Models
+Combine the strengths of multiple approaches:
+- Weighted ensemble of GARCH, XGBoost, and implied vol
+- Regime-switching model that selects the best forecaster per market condition
+- Attention-based neural networks (transformers) for sequence modeling
 
-### 3. Enhanced Forecasting
-- Ensemble methods combining GARCH, ML, and implied vol
-- High-frequency data for intraday vol prediction
-- Attention mechanisms (transformers) for sequence modeling
-
-### 4. Execution Improvements
-- Model bid-ask spreads explicitly
-- Add slippage modeling for realistic fills
-- Consider limit orders vs. market orders
-
-### 5. Alternative Strategies
-- **Dispersion trading**: Long single-stock vol, short index vol
-- **Calendar spreads**: Exploit term structure mispricings
-- **Volatility arbitrage**: Long realized, short implied via variance swaps
+### 3. Expanded Trading Strategies
+Test whether forecasting improvements translate better to alternative structures:
+- **Straddle/strangle trading**: Pure volatility plays without delta hedging
+- **Calendar spreads**: Exploit term structure mispricings using multi-horizon forecasts
+- **Volatility arbitrage**: Long realized vol, short implied vol via variance swaps
 
 ---
 
@@ -498,7 +513,7 @@ Key dependencies:
 - `scipy` for statistical tests and optimization
 - `matplotlib`, `plotly` for visualization
 
-Note: Options Data requires ThetaData Subscription
+Note: Options data requires ThetaData subscription.
 
 ### Run Full Backtest
 
@@ -531,6 +546,3 @@ Open `notebooks/xgboost_development.ipynb` to:
 - Analyze feature importance
 
 ---
-
-*Last updated: December 2025*
-
