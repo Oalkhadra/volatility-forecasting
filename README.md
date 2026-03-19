@@ -216,6 +216,10 @@ Gradient boosting model trained on engineered features capturing volatility dyna
 **Strengths**: Captures non-linear relationships, leverage effect, regime interactions  
 **Weaknesses**: Difficult to interpret, potential to overfitting
 
+## Comparison of Predicted Volatilities
+
+![IV Comparison](results/plots/iv_comparison.png)
+
 ---
 
 ## Trading Strategy
