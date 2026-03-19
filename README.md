@@ -30,8 +30,8 @@ This project implements a complete backtesting framework to evaluate different v
 **Key Findings**: 
 - While XGBoost significantly outperformed GARCH in volatility forecasting accuracy, there was **no statistically significant difference** when comparing either model to a naive historical estimate
 - The delta-neutral trading strategy **did not produce a meaningful risk-adjusted return** regardless of the volatility forecasting method used
-- When examining options-only P&L (excluding hedge positions), **XGBoost generated over $1M in option profits**—demonstrating superior mispricing detection that was subsequently eroded by hedging costs in a trending market
-- Delta hedging can completely erode gains from a successful options strategy, while also providing a safety net for poorly performing ones
+- When examining options-only P&L (excluding hedge positions), **XGBoost generated over $1M in option profits** (starting capital $500K), demonstrating superior mispricing detection that was subsequently eroded by hedging costs in a trending market
+- Delta hedging can completely erode gains from a successful options trading strategy, while also providing a safety net for poorly performing ones
 
 ### Performance Summary (Jan 2020 - Nov 2025)
 
