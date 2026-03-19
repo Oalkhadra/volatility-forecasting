@@ -314,7 +314,7 @@ Based on $500,000 initial capital:
 | Historical | +$14,144 | -$184,285 | -$170,141 | +$153,483 | -$16,658 |
 | GARCH | -$376,362 | -$347,348 | -$723,709 | +$560,553 | -$163,157 |
 
-**Interpretation**: XGBoost's option-only P&L of +$1.1M was almost entirely offset by hedge losses (-$1.03M). Conversely, GARCH's poor option performance (-$724K) was partially cushioned by hedge gains (+$561K). This demonstrates how delta hedging acts as a stabilizer—dampening both gains and losses.
+**Interpretation**: XGBoost's option-only P&L of +$1.1M was almost entirely offset by hedge losses (-$1.03M). Conversely, GARCH's poor option performance (-$724K) was partially cushioned by hedge gains (+$561K). This demonstrates how delta hedging acts as a stabilizer, dampening both gains and losses.
 
 ### Trade Distribution
 
@@ -385,7 +385,7 @@ XGBoost demonstrated statistically significant superiority over GARCH (p=0.0043 
 - **$1.8M better option P&L** than GARCH (+$1.1M vs -$724K)
 - Only positive total return among all strategies
 
-This underscores that **statistical significance is not sufficient for trading profitability**—strategy design, transaction costs, and execution quality matter equally. Conversely, a model without statistically significant forecasting improvement can still add substantial economic value through better option selection and timing.
+This underscores that **statistical significance is not sufficient for trading profitability**: strategy design, transaction costs, and execution quality matter equally. Conversely, a model without statistically significant forecasting improvement can still add substantial economic value through better option selection and timing.
 
 ---
 
@@ -403,7 +403,7 @@ This underscores that **statistical significance is not sufficient for trading p
 
 ### Diebold-Mariano Test Results
 
-Using QLIKE loss (appropriate for volatility forecasting):
+Using QLIKE loss:
 
 ```
 H0: No difference in predictive accuracy
@@ -414,7 +414,7 @@ GARCH vs Naive:      DM = +0.62,  p = 0.538  (No significant difference)
 XGBoost vs GARCH:    DM = -2.85,  p = 0.004  (XGBoost significantly better) ✓
 ```
 
-**Interpretation**: XGBoost's outperformance over GARCH is robust (>99% confidence), but neither sophisticated model significantly differs from istorical volatility at forecasting accuracy.
+**Interpretation**: XGBoost's outperformance over GARCH is robust (>99% confidence), but neither sophisticated model significantly differs from historical volatility at forecasting accuracy.
 
 ### Regime-Conditional Forecasting Performance
 
